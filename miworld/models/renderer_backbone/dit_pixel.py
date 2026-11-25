@@ -1,0 +1,2385 @@
+"""
+References:
+    - DiT: https://github.com/facebookresearch/DiT/blob/main/models.py
+    - Diffusion Forcing: https://github.com/buoyancy99/diffusion-forcing/blob/main/algorithms/diffusion_forcing/models/unet3d.py
+    - Latte: https://github.com/Vchitect/Latte/blob/main/models/latte.py
+"""
+
+
+from dataclasses import dataclass, field
+from math import atanh, isfinite, prod, sqrt
+from typing import Optional, Tuple
+
+import torch
+import torch.nn.functional as F
+from einops import rearrange
+from loguru import logger
+from timm.models.vision_transformer import Mlp
+from torch import nn
+from torch.utils.checkpoint import checkpoint
+
+from .attention import MultiHeadRMSNorm
+from .embeddings import TimestepEmbedder, RotaryEmbedding, apply_rotary_emb, \
+    PixelPatchEmbedder, DepthPatchEmbedder
+from .camera_util import camera_params_to_matrices
+from .kv_cache import commit_current_kv, valid_history
+
+
+def modulate(x, shift, scale):
+    fixed_dims = [1] * len(shift.shape[1:])
+    shift = shift.repeat(x.shape[0] // shift.shape[0], *fixed_dims)
+    scale = scale.repeat(x.shape[0] // scale.shape[0], *fixed_dims)
+    while shift.dim() < x.dim():
+        shift = shift.unsqueeze(-2)
+        scale = scale.unsqueeze(-2)
+    return x * (1 + scale) + shift
+
+def gate(x, g):
+    fixed_dims = [1] * len(g.shape[1:])
+    g = g.repeat(x.shape[0] // g.shape[0], *fixed_dims)
+    while g.dim() < x.dim():
+        g = g.unsqueeze(-2)
+    return g * x
+
+
+@torch.compiler.disable
+def _kv_cache_rope_offset(rotary_emb, axial_freqs, global_start_idx, spatial_sequence_shape=None):
+    """Compute RoPE position offset for KV cache mode. Disabled from torch.compile."""
+    idx = global_start_idx.item() if isinstance(global_start_idx, torch.Tensor) else global_start_idx
+    if spatial_sequence_shape is not None:
+        encoded_offset = rotary_emb.get_axial_freqs(1, *spatial_sequence_shape, offset=idx).reshape(1, prod(spatial_sequence_shape), -1)
+    else:
+        encoded_offset = rotary_emb.get_axial_freqs(1, offset=idx)
+    return axial_freqs + encoded_offset
+
+
+@torch.compiler.disable
+def _kv_cache_update(kv_cache, k, v, global_start_idx, T_new):
+    """Update KV cache with new entries. Disabled from torch.compile to avoid recompilation."""
+    idx = global_start_idx.item() if isinstance(global_start_idx, torch.Tensor) else global_start_idx
+    global_end_idx = idx + T_new
+    g_end = kv_cache["global_end_index"].item() if isinstance(kv_cache["global_end_index"], torch.Tensor) else kv_cache["global_end_index"]
+    window_moved = global_end_idx > g_end
+
+    cache_size = kv_cache["k"].shape[2]
+    l_end = kv_cache["local_end_index"].item() if isinstance(kv_cache["local_end_index"], torch.Tensor) else kv_cache["local_end_index"]
+    local_end_idx = l_end
+
+    if not window_moved:
+        local_end_idx = max(0, local_end_idx - T_new)
+
+    if window_moved and local_end_idx + T_new > cache_size:
+        n_remove = local_end_idx + T_new - cache_size
+        n_keep = local_end_idx - n_remove
+        kv_cache["k"][:, :, :n_keep] = kv_cache["k"][:, :, n_remove:local_end_idx].clone()
+        kv_cache["v"][:, :, :n_keep] = kv_cache["v"][:, :, n_remove:local_end_idx].clone()
+        local_end_idx -= n_remove
+
+    kv_cache["k"][:, :, local_end_idx:local_end_idx+T_new] = k
+    kv_cache["v"][:, :, local_end_idx:local_end_idx+T_new] = v
+
+    if isinstance(kv_cache["global_end_index"], torch.Tensor):
+        kv_cache["global_end_index"].fill_(global_end_idx)
+        kv_cache["local_end_index"].fill_(local_end_idx + T_new)
+    else:
+        kv_cache["global_end_index"] = global_end_idx
+        kv_cache["local_end_index"] = local_end_idx + T_new
+
+    return kv_cache["k"][:, :, :local_end_idx+T_new], kv_cache["v"][:, :, :local_end_idx+T_new]
+
+
+class PixelTemporalAxialAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        dim_head: int,
+        rotary_emb: RotaryEmbedding,
+        is_causal: bool = True,
+        causal_block_size: int = 1,
+        qk_rms_norm: bool = False,
+        flash_attn: bool = False,
+    ):
+        super().__init__()
+        self.inner_dim = dim_head * heads
+        self.heads = heads
+        self.head_dim = dim_head
+        self.inner_dim = dim_head * heads
+        self.to_qkv = nn.Linear(dim, self.inner_dim * 3, bias=False)
+        self.to_out = nn.Linear(self.inner_dim, dim)
+        self.rotary_emb = rotary_emb
+        self.is_causal = is_causal
+        if causal_block_size < 1:
+            raise ValueError("causal_block_size must be positive")
+        self.causal_block_size = causal_block_size
+        self.qk_rms_norm = qk_rms_norm
+        self.flash_attn = flash_attn
+
+        if qk_rms_norm:
+            self.q_rms_norm = MultiHeadRMSNorm(self.head_dim, heads)
+            self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, heads)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        kv_cache=None,
+        global_start_idx=0,
+        prefill=False,
+        cache_write=True,
+        return_kv_candidate=False,
+    ):
+        B, T, H, W, D = x.shape
+
+        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
+
+        q = rearrange(q, "B T H W (h d) -> (B H W) h T d", h=self.heads)
+        k = rearrange(k, "B T H W (h d) -> (B H W) h T d", h=self.heads)
+        v = rearrange(v, "B T H W (h d) -> (B H W) h T d", h=self.heads)
+
+        axial_freqs = self.rotary_emb.axial_freqs[:T]
+
+        # Candidate prefill must use the same absolute RoPE origin as decode.
+        if kv_cache is not None or return_kv_candidate:
+            axial_freqs = _kv_cache_rope_offset(self.rotary_emb, axial_freqs, global_start_idx, self.rotary_emb.spatial_sequence_shape)
+
+        # Correct order: QK RMSNorm first, then RoPE
+        if self.qk_rms_norm:
+            q = self.q_rms_norm(q)
+            k = self.k_rms_norm(k)
+
+        q = apply_rotary_emb(axial_freqs, q)
+        k = apply_rotary_emb(axial_freqs, k)
+
+        q, k, v = map(lambda t: t.contiguous(), (q, k, v))
+
+        current_k, current_v = k, v
+
+        # Legacy prefill/decode writes remain available. Final-denoise rollout
+        # uses cache_write=False and commits the returned candidate explicitly.
+        if kv_cache is not None:
+            if cache_write:
+                k, v = _kv_cache_update(kv_cache, k, v, global_start_idx, T)
+            else:
+                history_k, history_v = valid_history(kv_cache)
+                k = torch.cat((history_k, current_k), dim=2)
+                v = torch.cat((history_v, current_v), dim=2)
+
+        if self.flash_attn:
+            print("Flash Attention is currently disabled.")
+        else:
+            # Frame zero is the observed prefix. Future frames are causal between
+            # blocks and bidirectional within each generated block.
+            cached_chunk = (
+                self.is_causal and kv_cache is not None
+                and not cache_write and T > 1
+            )
+            if cached_chunk:
+                # The cache contains completed blocks only, so every query may
+                # see the complete history and all tokens in the current block.
+                attention_mask = torch.ones(T, k.shape[2], dtype=torch.bool, device=q.device)
+                x = F.scaled_dot_product_attention(
+                    query=q, key=k, value=v,
+                    attn_mask=attention_mask, is_causal=False,
+                )
+            else:
+                use_block_mask = self.is_causal and kv_cache is None and T > 1
+                if use_block_mask:
+                    query_index = torch.arange(T, device=q.device)[:, None]
+                    key_index = torch.arange(T, device=q.device)[None, :]
+                    # The observed frame at index zero is a one-frame prefix.
+                    block_end = torch.where(
+                        query_index == 0,
+                        torch.ones_like(query_index),
+                        1 + ((query_index - 1) // self.causal_block_size + 1)
+                        * self.causal_block_size,
+                    ).clamp_max(T)
+                    attention_mask = key_index < block_end
+                    x = F.scaled_dot_product_attention(
+                        query=q, key=k, value=v,
+                        attn_mask=attention_mask, is_causal=False,
+                    )
+                else:
+                    x = F.scaled_dot_product_attention(
+                        query=q, key=k, value=v, is_causal=False
+                    )
+
+        x = rearrange(x, "(B H W) h T d -> B T H W (h d)", B=B, H=H, W=W)
+        x = x.to(q.dtype)
+
+        # linear proj
+        x = self.to_out(x)
+        if return_kv_candidate:
+            return x, (current_k, current_v)
+        return x
+
+class PixelSpatialAxialAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        dim_head: int,
+        rotary_emb: RotaryEmbedding,
+        qk_rms_norm: bool = False,
+        flash_attn: bool = False,
+    ):
+        super().__init__()
+        self.inner_dim = dim_head * heads
+        self.heads = heads
+        self.head_dim = dim_head
+        self.inner_dim = dim_head * heads
+        self.to_qkv = nn.Linear(dim, self.inner_dim * 3, bias=False)
+        self.to_out = nn.Linear(self.inner_dim, dim)
+        self.rotary_emb = rotary_emb
+        self.qk_rms_norm = qk_rms_norm
+        self.flash_attn = flash_attn
+
+        if qk_rms_norm:
+            self.q_rms_norm = MultiHeadRMSNorm(self.head_dim, heads)
+            self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, heads)
+
+    def forward(self, x: torch.Tensor):
+        B, T, H, W, D = x.shape
+
+        q, k, v = self.to_qkv(x).chunk(3, dim=-1)
+
+        q = rearrange(q, "B T H W (h d) -> (B T) h H W d", h=self.heads)
+        k = rearrange(k, "B T H W (h d) -> (B T) h H W d", h=self.heads)
+        v = rearrange(v, "B T H W (h d) -> (B T) h H W d", h=self.heads)
+
+        # Correct order: QK RMSNorm first, then RoPE
+        if self.qk_rms_norm:
+            q = rearrange(q, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+            k = rearrange(k, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+            q = self.q_rms_norm(q)
+            k = self.k_rms_norm(k)
+            q = rearrange(q, "(B T) h (H W) d -> (B T) h H W d", B=B, T=T, H=H, W=W)
+            k = rearrange(k, "(B T) h (H W) d -> (B T) h H W d", B=B, T=T, H=H, W=W)
+
+        freqs = rearrange(self.rotary_emb.axial_freqs, "(H W) f -> H W f", H=H, W=W)
+        q = apply_rotary_emb(freqs, q)
+        k = apply_rotary_emb(freqs, k)
+
+        # prepare for attn
+        q = rearrange(q, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+        k = rearrange(k, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+        v = rearrange(v, "(B T) h H W d -> (B T) h (H W) d", B=B, T=T, h=self.heads)
+
+        if self.flash_attn:
+            print("Flash Attn is disabled")
+            #x = flash_attn.flash_attn_func(q, k, v, causal=False)
+        else:
+            x = F.scaled_dot_product_attention(query=q, key=k, value=v, is_causal=False)
+
+        x = rearrange(x, "(B T) h (H W) d -> B T H W (h d)", B=B, H=H, W=W)
+        x = x.to(q.dtype)
+
+        # linear proj
+        x = self.to_out(x)
+        return x
+
+class SpatioTemporalPixelDiTBlock(nn.Module):
+    def __init__(
+            self,
+            hidden_size,
+            num_heads,
+            mlp_ratio=4.0,
+            is_causal=True,
+            causal_block_size=1,
+            qk_rms_norm=False,
+            flash_attn=False,
+            pixel_spatial_emb: Optional[RotaryEmbedding] = None,
+            temporal_rotary_emb: Optional[RotaryEmbedding] = None,
+    ):
+        super().__init__()
+        self.is_causal = is_causal
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.flash_attn = flash_attn
+
+        self.s_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        # Pixel Spatial Self-Attn
+        self.s_attn = PixelSpatialAxialAttention(
+            hidden_size,
+            heads=num_heads,
+            dim_head=hidden_size // num_heads,
+            rotary_emb=pixel_spatial_emb,
+            qk_rms_norm=qk_rms_norm,
+            flash_attn=self.flash_attn,
+        )
+        self.s_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.s_mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=approx_gelu,
+            drop=0,
+        )
+        self.s_adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+
+        self.t_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        # Pixel Temporal Self-Attn
+        self.t_attn = PixelTemporalAxialAttention(
+            hidden_size,
+            heads=num_heads,
+            dim_head=hidden_size // num_heads,
+            is_causal=is_causal,
+            causal_block_size=causal_block_size,
+            rotary_emb=temporal_rotary_emb,
+            qk_rms_norm=qk_rms_norm,
+            flash_attn=self.flash_attn
+        )
+        self.t_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.t_mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=approx_gelu,
+            drop=0,
+        )
+        self.t_adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+
+
+    def forward(
+        self,
+        x,
+        c,
+        kv_cache=None,
+        global_start_idx=0,
+        prefill=False,
+        cache_write=True,
+        return_kv_candidate=False,
+        temporal_output_mask=None,
+    ):
+        B, T, H, W, D = x.shape
+
+        # spatial block
+        s_shift_msa, s_scale_msa, s_gate_msa, s_shift_mlp, s_scale_mlp, s_gate_mlp = self.s_adaLN_modulation(c).chunk(6, dim=-1)
+        x = x + gate(self.s_attn(modulate(self.s_norm1(x), s_shift_msa, s_scale_msa)), s_gate_msa)
+        x = x + gate(self.s_mlp(modulate(self.s_norm2(x), s_shift_mlp, s_scale_mlp)), s_gate_mlp)
+
+        # temporal block
+        t_shift_msa, t_scale_msa, t_gate_msa, t_shift_mlp, t_scale_mlp, t_gate_mlp = self.t_adaLN_modulation(c).chunk(6, dim=-1)
+        temporal_result = self.t_attn(
+            modulate(self.t_norm1(x), t_shift_msa, t_scale_msa),
+            kv_cache=kv_cache,
+            global_start_idx=global_start_idx,
+            prefill=prefill,
+            cache_write=cache_write,
+            return_kv_candidate=return_kv_candidate,
+        )
+        if return_kv_candidate:
+            temporal_out, kv_candidate = temporal_result
+        else:
+            temporal_out = temporal_result
+        if temporal_output_mask is not None:
+            temporal_out = temporal_out * temporal_output_mask.to(temporal_out.dtype)
+        x = x + gate(temporal_out, t_gate_msa)
+        x = x + gate(self.t_mlp(modulate(self.t_norm2(x), t_shift_mlp, t_scale_mlp)), t_gate_mlp)
+
+        if return_kv_candidate:
+            return x, kv_candidate
+        return x
+
+
+class AlignedAppearanceAdapter(nn.Module):
+    """Pointwise masked reference fusion after geometric texture alignment."""
+
+    def __init__(self, hidden_size: int, gate_dim: int = 128, value_dim: int = 256):
+        super().__init__()
+        self.x_norm = nn.LayerNorm(hidden_size)
+        self.reference_norm = nn.LayerNorm(hidden_size)
+        self.to_query = nn.Linear(hidden_size, gate_dim, bias=False)
+        self.to_key = nn.Linear(hidden_size, gate_dim, bias=False)
+        self.to_value = nn.Linear(hidden_size, value_dim)
+        self.to_output = nn.Linear(value_dim, hidden_size)
+        self.scale = 1 / sqrt(gate_dim)
+
+    def forward(self, x, reference, mask):
+        query = self.to_query(self.x_norm(x))
+        key = self.to_key(self.reference_norm(reference))
+        agreement = torch.sigmoid((query * key).sum(dim=-1, keepdim=True) * self.scale)
+        value = F.silu(self.to_value(self.reference_norm(reference)))
+        return self.to_output(value) * agreement * mask
+
+
+class EntityReferenceAdapter(nn.Module):
+    """Route each spatial token to detailed tokens of residents near its ROI."""
+
+    def __init__(self, hidden_size, reference_dim, attention_dim=64, value_dim=256):
+        super().__init__()
+        self.x_norm = nn.LayerNorm(hidden_size)
+        self.reference_norm = nn.LayerNorm(reference_dim)
+        self.to_query = nn.Linear(hidden_size, attention_dim, bias=False)
+        self.to_key = nn.Linear(reference_dim, attention_dim, bias=False)
+        self.to_value = nn.Linear(reference_dim, value_dim)
+        self.to_output = nn.Linear(value_dim, hidden_size)
+        self.scale = attention_dim ** -.5
+
+    def forward(self, x, reference, roi):
+        # x [B,T,H,W,D], reference [B,T,A,N,R], roi [B,T,A,H,W]
+        bsz, frames, height, width, _ = x.shape
+        spatial = height * width
+        query = self.to_query(self.x_norm(x)).flatten(2, 3)
+        normalized = self.reference_norm(reference)
+        key, value = self.to_key(normalized), self.to_value(normalized)
+        score = torch.einsum("btsh,btanh->btsan", query, key) * self.scale
+        routing = roi.flatten(3).permute(0, 1, 3, 2).clamp(0, 1)
+        score = score + routing.clamp_min(1e-6).log()[..., None]
+        attention = score.flatten(3).softmax(-1).unflatten(3, score.shape[3:])
+        output = torch.einsum("btsan,btanv->btsv", attention, value)
+        output *= routing.amax(-1, keepdim=True)
+        return self.to_output(output).unflatten(2, (height, width))
+
+
+class UnifiedPlayerReferenceAdapter(nn.Module):
+    """Fuse all four native appearance views through one shared adapter.
+
+    Unlike the legacy entity-reference path, this adapter does not select or
+    average a camera-facing view before attention.  The same module may be
+    reinvoked at selected depths; zero-initialized gates make that extension
+    an exact warm start instead of abruptly multiplying reference strength.
+    """
+
+    def __init__(
+        self,
+        hidden_size,
+        reference_dim,
+        attention_dim=64,
+        value_dim=256,
+        reinjection_count=0,
+        reference_grid_size=(8, 4),
+        geometry_aware=False,
+    ):
+        super().__init__()
+        self.x_norm = nn.LayerNorm(hidden_size)
+        self.reference_norm = nn.LayerNorm(reference_dim)
+        self.to_query = nn.Linear(hidden_size, attention_dim, bias=False)
+        self.to_key = nn.Linear(reference_dim, attention_dim, bias=False)
+        self.to_value = nn.Linear(reference_dim, value_dim)
+        self.to_output = nn.Linear(value_dim, hidden_size)
+        self.scale = attention_dim ** -.5
+        self.geometry_aware = bool(geometry_aware)
+        grid_height, grid_width = map(int, reference_grid_size)
+        if grid_height < 1 or grid_width < 1:
+            raise ValueError("reference grid dimensions must be positive")
+        reference_y, reference_x = torch.meshgrid(
+            torch.linspace(-1, 1, grid_height),
+            torch.linspace(-1, 1, grid_width),
+            indexing="ij",
+        )
+        self.register_buffer(
+            "reference_coordinates",
+            torch.stack((reference_x, reference_y), dim=-1).flatten(0, 1),
+            persistent=False,
+        )
+        if self.geometry_aware:
+            # softplus(1.85) is close to 2: a useful spatial prior without
+            # turning learned reference attention into hard texture sampling.
+            self.geometry_log_scale = nn.Parameter(torch.tensor(1.85))
+            # The layout's four-view distribution is deliberately softened:
+            # arbitrary camera angles may blend adjacent canonical views.
+            self.geometry_view_logit = nn.Parameter(torch.tensor(-1.10))
+        if reinjection_count:
+            self.reinjection_gates = nn.Parameter(torch.zeros(reinjection_count))
+
+    def forward(
+        self,
+        x,
+        reference,
+        roi,
+        valid,
+        view_weights=None,
+        local_coordinates=None,
+    ):
+        # x [B,T,H,W,D], reference [B,A,V,N,R], roi [B,T,A,H,W]
+        bsz, frames, height, width, _ = x.shape
+        if reference.ndim != 5 or reference.shape[0] != bsz:
+            raise ValueError("unified reference must be [B,A,V,N,D]")
+        agents, views = reference.shape[1:3]
+        if roi.shape != (bsz, frames, agents, height, width):
+            raise ValueError("unified reference ROI must be [B,T,A,H,W]")
+        if valid.shape != (bsz, agents, views):
+            raise ValueError("unified reference valid mask must be [B,A,V]")
+
+        query = self.to_query(self.x_norm(x)).flatten(2, 3)
+        normalized = self.reference_norm(reference)
+        key, value = self.to_key(normalized), self.to_value(normalized)
+        score = torch.einsum("btsh,bavnh->btsavn", query, key) * self.scale
+        routing = roi.flatten(3).permute(0, 1, 3, 2).clamp(0, 1)
+        routing = routing * valid.any(-1)[:, None, None].to(routing.dtype)
+        score = score + routing.clamp_min(1e-6).log()[..., None, None]
+        if self.geometry_aware:
+            if view_weights is None or local_coordinates is None:
+                raise ValueError(
+                    "geometry-aware reference requires view weights and local coordinates"
+                )
+            if view_weights.shape != (bsz, frames, agents, views):
+                raise ValueError(
+                    "unified reference view weights must be [B,T,A,V]"
+                )
+            expected_coordinates = (bsz, frames, agents, height, width, 2)
+            if local_coordinates.shape != expected_coordinates:
+                raise ValueError(
+                    "unified reference local coordinates must have shape "
+                    f"{expected_coordinates}"
+                )
+            target_coordinates = local_coordinates.flatten(3, 4).permute(0, 1, 3, 2, 4)
+            reference_coordinates = self.reference_coordinates.to(
+                device=x.device, dtype=x.dtype
+            )
+            if reference_coordinates.shape[0] != reference.shape[-2]:
+                raise ValueError("reference token count does not match configured grid")
+            squared_distance = (
+                target_coordinates[..., None, :] - reference_coordinates
+            ).square().sum(-1)
+            geometry_scale = F.softplus(self.geometry_log_scale).to(x.dtype)
+            score = score - geometry_scale * squared_distance[..., None, :]
+            view_prior_scale = self.geometry_view_logit.sigmoid().to(x.dtype)
+            view_log_prior = view_weights.to(x.dtype).clamp_min(1e-6).log()
+            score = score + view_prior_scale * view_log_prior[
+                :, :, None, :, :, None
+            ]
+        score = score.masked_fill(~valid[:, None, None, :, :, None], -1e4)
+        attention = score.flatten(3).softmax(-1).unflatten(3, score.shape[3:])
+        output = torch.einsum("btsavn,bavnd->btsd", attention, value)
+        output *= routing.amax(-1, keepdim=True)
+        return self.to_output(output).unflatten(2, (height, width))
+
+class PixelFinalLayer(nn.Module):
+    """
+    The final layer of pixel DiT.
+    """
+
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+        patch_size = (
+            (int(patch_size), int(patch_size))
+            if isinstance(patch_size, int)
+            else tuple(int(value) for value in patch_size)
+        )
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, prod(patch_size) * out_channels, bias=True)
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
+@dataclass
+class RasterizedVoxelDepthTransformerArgs:
+    feature_dim: int = 32
+    heads: int = 4
+    mlp_ratio: float = 4.0
+    output_dim: Optional[int] = None
+    frequency_embedding_size: int = 32
+    max_period: int = 10000
+    num_layers: int = 192
+    vol_render_mode: bool = False
+    qk_rms_norm: bool = True
+    is_causal_depth: bool = True #fixme inconsistent!!
+    flash_attn: bool = False
+    old: bool = False
+
+    @property
+    def name(self) -> str:
+        return "RasterizedVoxelDepthTransformer"
+
+
+class RasterizedVoxelDepthAttention(nn.Module):
+    """
+    Multi-head attention across depth layers for rasterized voxel latents.
+    Each pixel (H, W) location computes attention across its depth layers independently.
+    Uses causal masking so tokens only attend to tokens before them in depth (depth-sorted).
+
+    Supports volume rendering configuration with single head and identity values.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int = 4,
+        vol_render_mode: bool = False,
+        qk_rms_norm: bool = True,
+        is_causal: bool = True,
+        flash_attn: bool = False
+    ):
+        super().__init__()
+        self.vol_render_mode = vol_render_mode
+        self.qk_rms_norm = qk_rms_norm
+        self.is_causal = is_causal
+        self.flash_attn = flash_attn
+
+        if vol_render_mode:
+            self.heads = 1
+            self.dim_head = dim
+        else:
+            assert dim % heads == 0, f"dim={dim} must be divisible by heads={heads}"
+            self.heads = heads
+            self.dim_head = dim // heads
+
+        self.inner_dim = self.heads * self.dim_head
+
+        # Q, K projections (V is identity in vol_render mode)
+        self.to_q = nn.Linear(dim, self.inner_dim, bias=False)
+        self.to_k = nn.Linear(dim, self.inner_dim, bias=False)
+
+        if not vol_render_mode:
+            self.to_v = nn.Linear(dim, self.inner_dim, bias=False)
+            self.to_out = nn.Linear(self.inner_dim, dim)
+
+        if qk_rms_norm:
+            self.q_rms_norm = MultiHeadRMSNorm(self.dim_head, self.heads)
+            self.k_rms_norm = MultiHeadRMSNorm(self.dim_head, self.heads)
+
+    def forward(self, voxel_latents: torch.Tensor, depth_embeddings: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            voxel_latents: (B, H, W, num_layers, feature_dim) - rasterized voxel latents (depth-sorted)
+            depth_embeddings: (B, H, W, num_layers, enc_dim) - depth positional embeddings
+
+        Returns:
+            output: (B, H, W, num_layers, feature_dim) - attended features
+        """
+        B, H, W, L, D = voxel_latents.shape
+
+        # Combine voxel latents with depth embeddings for Q/K computation
+        voxel_latents = rearrange(voxel_latents, 'b h w l c -> (b h w) l c', b=B, h=H, w=W)
+        qk_input = voxel_latents + depth_embeddings
+
+        # Generate depth-aware queries and keys
+        q = self.to_q(qk_input)
+        k = self.to_k(qk_input)
+
+        # Reshape for multi-head attention
+        q = rearrange(q, 'bhw l (h d) -> bhw h l d', h=self.heads)
+        k = rearrange(k, 'bhw l (h d) -> bhw h l d', h=self.heads)
+
+        if self.qk_rms_norm:
+            q = self.q_rms_norm(q)
+            k = self.k_rms_norm(k)
+
+        if self.vol_render_mode:
+            v = rearrange(voxel_latents, 'bhw l (h d) -> bhw h l d', h=self.heads)
+        else:
+            #TODO change naming of qk_input # Standard learned values from voxel_latents + depth_embeddings
+            v = self.to_v(qk_input)
+            v = rearrange(v, 'bhw l (h d) -> bhw h l d', h=self.heads)
+
+        # Causal attention: depth-aware Q/K compute weights for V
+        if self.flash_attn:
+            print("Flash attention is currently disabled.")
+            #attn_output = flash_attn.flash_attn_func(q, k, v, causal=self.is_causal)
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                query=q, key=k, value=v, is_causal=self.is_causal
+            )
+        attn_output = rearrange(attn_output, 'bhw h l d -> bhw l (h d)')
+
+        if self.vol_render_mode:
+            # Single head output, keep original dimension
+            output = attn_output
+        else:
+            # Multi-head output with projection
+            output = self.to_out(attn_output)
+
+        output = rearrange(output, '(b h w) l d -> b h w l d', b=B, h=H, w=W)
+
+        return output
+
+
+class RasterizedVoxelDepthTransformer(nn.Module):
+    """
+    Standalone transformer block for aggregating voxel latents across depth layers.
+    Processes each pixel's depth layers independently with causal self-attention.
+
+    Uses TimestepEmbedder from .embeddings for depth encoding.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int = 8,
+        heads: int = 4,
+        mlp_ratio: float = 4.0,
+        num_layers : int = 64,
+        output_dim: Optional[int] = None,
+        frequency_embedding_size: int = 256,
+        max_period: int = 10000,
+        vol_render_mode: bool = False,
+        qk_rms_norm: bool = True,
+        flash_attn: bool = False,
+        is_causal_depth: bool = True,
+        old: bool = False
+    ):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.vol_render_mode = vol_render_mode
+        self.num_layers = num_layers
+        self.is_causal_depth = is_causal_depth
+        self.flash_attn = flash_attn
+        self.old = old
+
+        if self.vol_render_mode:
+            self.output_dim = feature_dim
+        else:
+            self.output_dim = output_dim or feature_dim
+
+        mlp_hidden_dim = int(feature_dim * mlp_ratio)
+
+        # Depth positional encoding using TimestepEmbedder
+        # Assume depth values are already normalized [0,1]
+        self.depth_embedder = TimestepEmbedder(
+            hidden_size=feature_dim,
+            frequency_embedding_size=frequency_embedding_size,
+            max_period=max_period,
+        )
+
+        # Attention block with causal masking and vol_render support
+        self.norm1 = nn.LayerNorm(feature_dim)
+        self.attn = RasterizedVoxelDepthAttention(
+            dim=feature_dim,
+            heads=heads,
+            vol_render_mode=vol_render_mode,
+            qk_rms_norm=qk_rms_norm,
+            flash_attn=flash_attn,
+            is_causal=is_causal_depth
+        )
+
+        # Aggregation MLP (used in both configurations)
+        self.norm_2 = nn.LayerNorm(feature_dim)
+        if not self.vol_render_mode and not self.old:
+            self.aggregation_mlp_0 = Mlp(
+                in_features=feature_dim*num_layers,
+                hidden_features=mlp_hidden_dim*2,
+                out_features=feature_dim,
+                drop=0.0
+            )
+        self.aggregation_mlp = Mlp(
+            in_features=feature_dim,
+            hidden_features=mlp_hidden_dim,
+            out_features=self.output_dim,
+            drop=0.0
+        )
+
+    def forward(
+        self,
+        voxel_latents: torch.Tensor,
+        depth_values: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            voxel_latents: (B, H, W, num_layers, feature_dim) - rasterized voxel latents (depth-sorted)
+            depth_values: (B, H, W, num_layers) - normalized depth values [0,1] (depth-sorted)
+
+        Returns:
+            aggregated_features: (B, H, W, output_dim) - single feature map per pixel
+        """
+        B, H, W, L, D = voxel_latents.shape
+
+        # Flatten for TimestepEmbedder: (B*H*W*L,)
+        depth_flat = rearrange(depth_values, 'b h w l -> (b h w l)')
+
+        # Get depth embeddings using TimestepEmbedder
+        depth_embeddings_flat = self.depth_embedder(depth_flat*1000)  # (B*H*W*L, feature_dim)
+
+        # Reshape back: (B, H, W, L, feature_dim) -> (B, H, W, feature_dim, L)
+        depth_embeddings = rearrange(
+            depth_embeddings_flat,
+            '(b h w l) d -> (b h w) l d',
+            b=B, h=H, w=W, l=L
+        )
+
+        # Causal self-attention with depth-aware Q/K and pure/mixed V
+        if not self.vol_render_mode:
+            voxel_latents = self.norm1(voxel_latents)
+
+        x = self.attn(voxel_latents, depth_embeddings) #B H W L D
+
+        if self.vol_render_mode:
+            # Output should be an actual vol rendering of the voxel latents using attn
+            x = torch.sum(x, dim=-2)  # (B, H, W, D)
+        else:
+            x += voxel_latents #residual
+            if self.old:
+                x = torch.sum(x, dim=-2)
+            else:
+                x = rearrange(x, 'b h w l d -> b h w (l d)')
+                x = self.aggregation_mlp_0(x)
+            x = self.norm_2(x)
+            x = rearrange(x, 'b h w d -> (b h w) d')  # flatten depth for MLP
+            x = self.aggregation_mlp(x)  # (B, H, W, output_dim)
+            x = rearrange(x, '(b h w) d -> b h w d', b=B, h=H, w=W)
+
+        return x
+
+
+@dataclass(kw_only=True)
+class FrameDepthStackPixelDitDenoiserArgs:
+    """Configuration for DiT Denoiser."""
+
+    input_h : int = 36
+    input_w : int = 64
+    patch_size : Tuple[int, int] | int = 2
+    in_channels : int = 16
+    hidden_size : int = 1024
+    depth : int = 12
+    num_heads : int = 16
+    mlp_ratio : int = 4.0
+    raster_cond_shape : Tuple[int, ...] = (32, 36, 64)
+    raster_cond_patch_size : int = 2
+    action_cond_dim : int = 23
+    extra_condition_dim : int = 0
+    actor_condition_dim : int = 0
+    roi_appearance_dim : int = 0
+    deep_condition_reinjection : bool = False
+    hud_condition_dim : int = 0
+    appearance_condition_dim : int = 0
+    detail_preserving_appearance : bool = False
+    entity_reference_dim : int = 0
+    unified_reference_dim : int = 0
+    unified_reference_grid_size : Tuple[int, int] = (8, 4)
+    geometry_aware_player_reference : bool = False
+    unified_reference_reinject_blocks : Tuple[int, ...] = ()
+    simple_conditioning : bool = False
+    split_player_conditioning : bool = False
+    other_player_condition_blocks : Tuple[int, ...] = ()
+    gated_other_player_conditioning : bool = False
+    other_player_action_only : bool = False
+    other_player_roi_adaln : bool = False
+    other_player_action_orientation_only : bool = False
+    independent_roi_appearance_tokens : bool = False
+    roi_appearance_condition_blocks : Tuple[int, ...] = ()
+    roi_appearance_reinject_blocks : Tuple[int, ...] = ()
+    oracle_player_geometry : bool = False
+    player_fusion_depth : int = 0
+    context_window_size : int = 16
+    cache_window_size : int = 32
+    is_causal : bool = True
+    use_condition_mask : bool = False
+    rotary_max_freq : int = 256
+    voxel_dim : int = 48
+    num_freqs : int = 8
+    qk_rms_norm : bool = True
+    flash_attn : bool = False
+    detach_raster_grad : bool = False
+    learned_padding : bool = False
+    dropout_p_pixel : float = 0.0
+    gradient_checkpointing : bool = False
+    depth_patch_size : int = 6
+    depth_stride_size : int = 4
+    depth_output_dim : int = 16
+    aggregation_config : RasterizedVoxelDepthTransformerArgs = field(
+        default_factory=RasterizedVoxelDepthTransformerArgs
+    )
+
+    @property
+    def name(self) -> str:
+        return "FrameDepthStackPixelDiT"
+
+
+class FrameDepthStackPixelDiT(nn.Module):
+    """
+    Diffusion model with a Transformer backbone and stacking voxel latent raster + pixel latent.
+    """
+
+    def __init__(
+            self,
+            input_h=18,
+            input_w=32,
+            patch_size=2,
+            in_channels=16,
+            hidden_size=1024,
+            depth=12,
+            num_heads=16,
+            mlp_ratio=4.0,
+            raster_cond_shape=(8, 36, 64),
+            raster_cond_patch_size=2,
+            action_cond_dim=23,
+            extra_condition_dim=0,
+            actor_condition_dim=0,
+            roi_appearance_dim=0,
+            deep_condition_reinjection=False,
+            hud_condition_dim=0,
+            appearance_condition_dim=0,
+            detail_preserving_appearance=False,
+            entity_reference_dim=0,
+            unified_reference_dim=0,
+            unified_reference_grid_size=(8, 4),
+            geometry_aware_player_reference=False,
+            unified_reference_reinject_blocks=(),
+            simple_conditioning=False,
+            parallel_player_feature=False,
+            parallel_player_feature_block=-1,
+            parallel_player_feature_blocks=(),
+            parallel_player_fusion=False,
+            parallel_player_skip_gate_init=1.0,
+            parallel_player_masked_fusion=False,
+            mask_player_temporal_attention=False,
+            split_player_conditioning=False,
+            other_player_condition_blocks=(),
+            gated_other_player_conditioning=False,
+            other_player_action_only=False,
+            other_player_roi_adaln=False,
+            other_player_action_orientation_only=False,
+            independent_roi_appearance_tokens=False,
+            roi_appearance_condition_blocks=(),
+            roi_appearance_reinject_blocks=(),
+            oracle_player_geometry=False,
+            player_fusion_depth=0,
+            context_window_size=32,
+            cache_window_size=32,
+            is_causal=True,
+            causal_block_size=1,
+            use_condition_mask=False,
+            rotary_max_freq=256,
+            voxel_dim=48,
+            num_freqs=8,
+            qk_rms_norm=False,
+            detach_raster_grad=False,
+            flash_attn=False,
+            learned_padding=False,
+            dropout_p_pixel=0.0,
+            gradient_checkpointing=False,
+            depth_patch_size=6,
+            depth_stride_size=4,
+            depth_output_dim=16,
+            aggregation_config=None,
+            use_kv_cache=False,
+            batch_size=None,
+    ):
+        super().__init__()
+        logger.info("FrameDepthStack DiT")
+        self.input_h = input_h
+        self.input_w = input_w
+        self.in_channels = in_channels
+        self.out_channels = in_channels
+        self.patch_size = (
+            (int(patch_size), int(patch_size))
+            if isinstance(patch_size, int)
+            else tuple(int(value) for value in patch_size)
+        )
+        if len(self.patch_size) != 2 or min(self.patch_size) < 1:
+            raise ValueError("patch_size must be a positive int or (height, width)")
+        if input_h % self.patch_size[0] or input_w % self.patch_size[1]:
+            raise ValueError(
+                f"input {(input_h, input_w)} must be divisible by patch {self.patch_size}"
+            )
+        patch_size = self.patch_size
+        self.depth_stride_size = depth_stride_size  # non-overlapping
+        self.num_heads = num_heads
+        self.hidden_size = hidden_size
+        self.depth = depth
+        self.context_window_size = context_window_size
+        self.cache_window_size = cache_window_size
+        if self.cache_window_size <= 0:
+            raise ValueError("cache_window_size must be positive")
+        self.is_causal = is_causal
+        self.causal_block_size = causal_block_size
+        self.use_condition_mask = use_condition_mask
+        self.detach_raster_grad = detach_raster_grad
+        self.flash_attn = flash_attn
+        self.learned_padding = learned_padding
+        self.voxel_dim = voxel_dim
+        self.num_freqs = num_freqs
+        self.use_kv_cache = use_kv_cache
+        self.batch_size = batch_size
+        self.kv_caches = None
+        self.raster_cache = None
+        self.qk_rms_norm = qk_rms_norm
+        self.gradient_checkpointing = gradient_checkpointing
+        self.simple_conditioning = bool(simple_conditioning)
+        self.parallel_player_feature = bool(parallel_player_feature)
+        self.parallel_player_feature_block = int(parallel_player_feature_block)
+        self.parallel_player_feature_blocks = tuple(
+            int(index) for index in parallel_player_feature_blocks
+        )
+        self.parallel_player_fusion = bool(parallel_player_fusion)
+        self.parallel_player_masked_fusion = bool(parallel_player_masked_fusion)
+        self.mask_player_temporal_attention = bool(mask_player_temporal_attention)
+        self.split_player_conditioning = bool(split_player_conditioning)
+        self.other_player_condition_blocks = tuple(
+            int(index) for index in other_player_condition_blocks
+        )
+        self.gated_other_player_conditioning = bool(
+            gated_other_player_conditioning
+        )
+        self.other_player_action_only = bool(other_player_action_only)
+        self.other_player_roi_adaln = bool(other_player_roi_adaln)
+        if self.other_player_roi_adaln:
+            self.other_player_condition_blocks = tuple(range(depth))
+        if self.other_player_roi_adaln and (
+            not split_player_conditioning or player_fusion_depth
+        ):
+            raise ValueError("ROI AdaLN requires split conditioning without fusion blocks")
+        self.other_player_action_orientation_only = bool(
+            other_player_action_orientation_only
+        )
+        self.independent_roi_appearance_tokens = bool(
+            independent_roi_appearance_tokens
+        )
+        self.roi_appearance_condition_blocks = tuple(
+            int(index) for index in roi_appearance_condition_blocks
+        )
+        self.roi_appearance_reinject_blocks = tuple(
+            int(index) for index in roi_appearance_reinject_blocks
+        )
+        self.oracle_player_geometry = bool(oracle_player_geometry)
+        self.player_fusion_depth = int(player_fusion_depth)
+        if self.player_fusion_depth < 0:
+            raise ValueError("player_fusion_depth must be nonnegative")
+        if self.player_fusion_depth and not (
+            self.split_player_conditioning
+            and self.independent_roi_appearance_tokens
+            and not is_causal
+        ):
+            raise ValueError(
+                "player fusion blocks require non-causal split-player "
+                "conditioning with independent ROI appearance tokens"
+            )
+        if not isfinite(parallel_player_skip_gate_init):
+            raise ValueError("parallel player skip gate init must be finite")
+        self.actor_condition_dim = int(actor_condition_dim)
+        self.roi_appearance_dim = int(roi_appearance_dim)
+        if self.simple_conditioning and (
+            self.actor_condition_dim <= 0 or self.roi_appearance_dim <= 0
+        ):
+            raise ValueError(
+                "M3-Simple requires resident and ROI appearance input channels"
+            )
+        if self.parallel_player_feature and not self.simple_conditioning:
+            raise ValueError("parallel player features require M3-Simple")
+        if self.oracle_player_geometry and not self.simple_conditioning:
+            raise ValueError("oracle player geometry requires M3-Simple")
+        if self.roi_appearance_reinject_blocks and not (
+            self.independent_roi_appearance_tokens and self.split_player_conditioning
+        ):
+            raise ValueError(
+                "ROI appearance reinjection requires independent split-player tokens"
+            )
+        if self.roi_appearance_condition_blocks and not (
+            self.independent_roi_appearance_tokens and self.split_player_conditioning
+        ):
+            raise ValueError(
+                "early ROI appearance conditioning requires independent "
+                "split-player tokens"
+            )
+        if (
+            self.roi_appearance_condition_blocks
+            and self.roi_appearance_reinject_blocks
+        ):
+            raise ValueError(
+                "early ROI appearance conditioning and legacy appearance "
+                "reinjection are mutually exclusive"
+            )
+        if len(set(self.roi_appearance_condition_blocks)) != len(
+            self.roi_appearance_condition_blocks
+        ) or any(
+            index < 0 or index >= depth
+            for index in self.roi_appearance_condition_blocks
+        ):
+            raise ValueError(
+                "ROI appearance condition blocks must be unique valid block indices"
+            )
+        if len(set(self.roi_appearance_reinject_blocks)) != len(
+            self.roi_appearance_reinject_blocks
+        ) or any(
+            index < 0 or index >= depth
+            for index in self.roi_appearance_reinject_blocks
+        ):
+            raise ValueError(
+                "ROI appearance reinjection blocks must be unique valid block indices"
+            )
+        if self.parallel_player_feature_block < -1 or self.parallel_player_feature_block >= depth:
+            raise ValueError("parallel player feature block must be -1 or a valid DiT block")
+        if len(set(self.parallel_player_feature_blocks)) != len(
+            self.parallel_player_feature_blocks
+        ):
+            raise ValueError("parallel player feature blocks must be unique")
+        if any(
+            index < 0 or index >= depth
+            for index in self.parallel_player_feature_blocks
+        ):
+            raise ValueError(
+                "parallel player feature blocks must be valid DiT block indices"
+            )
+        if (
+            self.parallel_player_feature_blocks
+            and self.parallel_player_feature_block != -1
+        ):
+            raise ValueError(
+                "parallel player feature block and blocks are mutually exclusive"
+            )
+        if not self.parallel_player_feature and (
+            self.parallel_player_feature_block != -1
+            or self.parallel_player_feature_blocks
+        ):
+            raise ValueError("parallel player feature blocks require parallel player features")
+        if self.parallel_player_fusion and not self.parallel_player_feature:
+            raise ValueError("parallel player fusion requires parallel player features")
+        if self.parallel_player_masked_fusion and not self.parallel_player_feature:
+            raise ValueError("masked player fusion requires parallel player features")
+        if self.mask_player_temporal_attention and not self.split_player_conditioning:
+            raise ValueError(
+                "player temporal masking requires split player conditioning"
+            )
+        if self.split_player_conditioning and not self.simple_conditioning:
+            raise ValueError("split player conditioning requires M3-Simple")
+        if self.split_player_conditioning and (
+            action_cond_dim <= 0 or extra_condition_dim <= 0
+        ):
+            raise ValueError(
+                "split player conditioning requires action and resident state embedders"
+            )
+        if self.other_player_action_only and not self.split_player_conditioning:
+            raise ValueError(
+                "other-player action-only routing requires split player conditioning"
+            )
+        if (
+            self.other_player_action_orientation_only
+            and not self.split_player_conditioning
+        ):
+            raise ValueError(
+                "other-player action/orientation routing requires split player "
+                "conditioning"
+            )
+        if (
+            self.other_player_action_only
+            and self.other_player_action_orientation_only
+        ):
+            raise ValueError(
+                "raw action-only and action/orientation-only routing are mutually "
+                "exclusive"
+            )
+        if self.independent_roi_appearance_tokens and not self.simple_conditioning:
+            raise ValueError(
+                "independent ROI appearance tokens require M3-Simple"
+            )
+        if len(set(self.other_player_condition_blocks)) != len(
+            self.other_player_condition_blocks
+        ):
+            raise ValueError("other-player condition blocks must be unique")
+        if any(
+            index < 0 or index >= depth
+            for index in self.other_player_condition_blocks
+        ):
+            raise ValueError(
+                "other-player condition blocks must be valid DiT block indices"
+            )
+        if self.split_player_conditioning != bool(
+            self.other_player_condition_blocks
+        ):
+            raise ValueError(
+                "split player conditioning and other-player condition blocks "
+                "must be enabled together"
+            )
+        if self.gated_other_player_conditioning and not self.split_player_conditioning:
+            raise ValueError(
+                "gated other-player conditioning requires split player conditioning"
+            )
+        if self.gated_other_player_conditioning and self.player_fusion_depth:
+            raise ValueError(
+                "gated trunk conditioning and prepended player-fusion blocks "
+                "are mutually exclusive"
+            )
+        self.deep_condition_reinjection = bool(deep_condition_reinjection)
+        self.unified_reference_reinject_blocks = tuple(
+            int(index) for index in unified_reference_reinject_blocks
+        )
+        if len(set(self.unified_reference_reinject_blocks)) != len(
+            self.unified_reference_reinject_blocks
+        ):
+            raise ValueError("unified reference reinjection blocks must be unique")
+        if any(
+            index < 0 or index >= depth
+            for index in self.unified_reference_reinject_blocks
+        ):
+            raise ValueError(
+                "unified reference reinjection blocks must be valid DiT block indices"
+            )
+        if self.unified_reference_reinject_blocks and unified_reference_dim <= 0:
+            raise ValueError(
+                "unified reference reinjection blocks require unified reference tokens"
+            )
+        self._unified_reference_reinject_gate = {
+            block: gate
+            for gate, block in enumerate(self.unified_reference_reinject_blocks)
+        }
+
+        # Calculate depth-compressed raster dimensions
+        raster_num_layers = self.voxel_dim * 4
+        raster_layers_out = (raster_num_layers - depth_patch_size) // depth_stride_size + 1
+        raster_channels_total = raster_layers_out * depth_output_dim
+        # M3-Simple jointly embeds every target-aligned dense input. Appearance
+        # reaches this point as implicit ROI-attended features, never as a
+        # resized or warped reference image.
+        simple_spatial_channels = (
+            self.actor_condition_dim + self.roi_appearance_dim
+            if self.simple_conditioning
+            else 0
+        )
+        total_in_channels = in_channels + raster_channels_total + simple_spatial_channels
+        #embedders. Takes depth sorted features + depths as input. Concats depth features and depth positional encodings then convolves with 1d filter.
+        self.depth_embedder = DepthPatchEmbedder(
+            num_layers=raster_num_layers,
+            patch_size=depth_patch_size,
+            stride=depth_stride_size,
+            in_chans=raster_cond_shape[0],
+            out_chans=depth_output_dim,
+            use_depth_pos_enc=True,
+            num_freqs=num_freqs,
+        )
+        #self.pixel_dropout = nn.Dropout3d(dropout_p_pixel)
+        self.x_embedder = PixelPatchEmbedder(input_h, input_w, patch_size, total_in_channels, hidden_size, flatten=False)
+        self.roi_appearance_token_width = 256
+        self.roi_appearance_token_embedder = (
+            nn.Sequential(
+                nn.Conv2d(
+                    self.roi_appearance_dim,
+                    self.roi_appearance_token_width,
+                    kernel_size=patch_size,
+                    stride=patch_size,
+                    bias=False,
+                ),
+                nn.Conv2d(
+                    self.roi_appearance_token_width,
+                    hidden_size,
+                    kernel_size=1,
+                    bias=False,
+                ),
+            )
+            if self.independent_roi_appearance_tokens else None
+        )
+        self.roi_appearance_token_gate = (
+            nn.Parameter(torch.tensor(1.0))
+            if self.independent_roi_appearance_tokens else None
+        )
+        self.roi_appearance_condition_gates = (
+            nn.Parameter(torch.full(
+                (len(self.roi_appearance_condition_blocks),),
+                atanh(min(0.99, 1.0 / len(self.roi_appearance_condition_blocks))),
+            ))
+            if self.roi_appearance_condition_blocks else None
+        )
+        self._roi_appearance_condition_gate = {
+            block: gate
+            for gate, block in enumerate(self.roi_appearance_condition_blocks)
+        }
+        self.roi_appearance_reinject_gates = (
+            nn.Parameter(torch.zeros(len(self.roi_appearance_reinject_blocks)))
+            if self.roi_appearance_reinject_blocks else None
+        )
+        self._roi_appearance_reinject_gate = {
+            block: gate
+            for gate, block in enumerate(self.roi_appearance_reinject_blocks)
+        }
+        self.oracle_player_geometry_embedder = (
+            nn.Conv2d(
+                2,
+                hidden_size,
+                kernel_size=patch_size,
+                stride=patch_size,
+            )
+            if self.oracle_player_geometry else None
+        )
+        self.parallel_player_adapter = None
+        self.parallel_player_fusion_module = None
+        self.parallel_player_environment_norm = None
+        self.parallel_player_fusion_gate = None
+        self.parallel_player_skip_gate = None
+        if self.parallel_player_feature:
+            # Preserve the reference projector as a 2D feature map and add it
+            # beside the frozen DiT immediately before the latent output head.
+            # The last projection starts at zero, so enabling this branch is a
+            # checkpoint-compatible residual rather than an RGB/mask composite.
+            branch_width = max(hidden_size // 8, 64)
+            self.parallel_player_adapter = nn.Sequential(
+                nn.Conv2d(self.roi_appearance_dim, branch_width, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(
+                    branch_width, hidden_size,
+                    kernel_size=patch_size, stride=patch_size,
+                ),
+            )
+            if self.parallel_player_fusion:
+                # Use the player tokens to modulate the existing environment
+                # representation instead of assuming that both branches already
+                # share a directly-additive feature space.
+                self.parallel_player_fusion_module = nn.Sequential(
+                    nn.LayerNorm(hidden_size),
+                    nn.Linear(hidden_size, hidden_size),
+                    nn.SiLU(),
+                    nn.Linear(hidden_size, 2 * hidden_size),
+                )
+                self.parallel_player_environment_norm = nn.LayerNorm(
+                    hidden_size, elementwise_affine=False
+                )
+                self.parallel_player_fusion_gate = nn.Parameter(torch.tensor(0.1))
+                self.parallel_player_skip_gate = nn.Parameter(
+                    torch.tensor(float(parallel_player_skip_gate_init))
+                )
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.action_embedder = nn.Linear(action_cond_dim, hidden_size) if action_cond_dim > 0 else nn.Identity()
+        self.other_player_condition_gates = (
+            nn.Parameter(torch.full(
+                (len(self.other_player_condition_blocks),),
+                atanh(min(0.99, 1.0 / len(self.other_player_condition_blocks))),
+            ))
+            if self.gated_other_player_conditioning else None
+        )
+        self._other_player_condition_gate = {
+            block: gate
+            for gate, block in enumerate(self.other_player_condition_blocks)
+        }
+        self.other_player_action_embedder = (
+            nn.Linear(action_cond_dim, hidden_size)
+            if self.player_fusion_depth > 0 and action_cond_dim > 0
+            else None
+        )
+        self.other_player_orientation_embedder = (
+            nn.Linear(4, hidden_size, bias=False)
+            if self.other_player_action_orientation_only else None
+        )
+        self.window_prefix_embedding = nn.Parameter(torch.zeros(hidden_size))
+        self.extra_condition_embedder = (
+            nn.Linear(extra_condition_dim, hidden_size) if extra_condition_dim > 0 else None
+        )
+        self.actor_condition_embedder = (
+            nn.Conv2d(actor_condition_dim, hidden_size, kernel_size=patch_size, stride=patch_size)
+            if actor_condition_dim > 0 and not self.simple_conditioning
+            else None
+        )
+        self.condition_mask_embedder = nn.Linear(1, hidden_size) if use_condition_mask else None
+        if self.deep_condition_reinjection:
+            if hud_condition_dim < 1:
+                raise ValueError("deep condition reinjection requires hud_condition_dim")
+            self.hud_condition_embedder = nn.Conv2d(
+                hud_condition_dim, hidden_size, kernel_size=patch_size, stride=patch_size
+            )
+            self.condition_reinjectors = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.LayerNorm(hidden_size),
+                        nn.SiLU(),
+                        nn.Linear(hidden_size, hidden_size),
+                    )
+                    for _ in range(depth)
+                ]
+            )
+        else:
+            self.hud_condition_embedder = None
+            self.condition_reinjectors = None
+        if appearance_condition_dim > 0:
+            self.appearance_condition_embedder = nn.Sequential(
+                nn.Conv2d(appearance_condition_dim, 64, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(64, hidden_size, kernel_size=patch_size, stride=patch_size),
+            )
+            self.appearance_reinjectors = nn.ModuleList(
+                [AlignedAppearanceAdapter(hidden_size) for _ in range(depth)]
+            )
+            if detail_preserving_appearance:
+                if self.patch_size[0] != self.patch_size[1]:
+                    raise ValueError(
+                        "detail-preserving legacy appearance requires a square patch"
+                    )
+                # Preserve the four values inside every 2x2 latent patch before
+                # projecting them to a DiT token.  This gives small residents a
+                # direct path that does not first blur neighboring pixels.
+                self.appearance_detail_embedder = nn.Sequential(
+                    nn.PixelUnshuffle(self.patch_size[0]),
+                    nn.Conv2d(appearance_condition_dim * prod(self.patch_size), 256, 1),
+                    nn.SiLU(),
+                    nn.Conv2d(256, hidden_size, 1),
+                )
+                self.appearance_detail_reinjectors = nn.ModuleList(
+                    [AlignedAppearanceAdapter(hidden_size) for _ in range(depth)]
+                )
+            else:
+                self.appearance_detail_embedder = None
+                self.appearance_detail_reinjectors = None
+        else:
+            self.appearance_condition_embedder = None
+            self.appearance_reinjectors = None
+            self.appearance_detail_embedder = None
+            self.appearance_detail_reinjectors = None
+        if entity_reference_dim > 0:
+            self.entity_reference_adapters = nn.ModuleList(
+                [EntityReferenceAdapter(hidden_size, entity_reference_dim) for _ in range(depth)]
+            )
+        else:
+            self.entity_reference_adapters = None
+        self.unified_reference_adapter = (
+            UnifiedPlayerReferenceAdapter(
+                hidden_size,
+                unified_reference_dim,
+                reinjection_count=len(self.unified_reference_reinject_blocks),
+                reference_grid_size=unified_reference_grid_size,
+                geometry_aware=geometry_aware_player_reference,
+            )
+            if unified_reference_dim > 0
+            else None
+        )
+
+        #spatial encodings
+        self.pixel_spatial_emb = RotaryEmbedding(
+            dim=hidden_size // num_heads // 2,
+            freqs_for="pixel",
+            max_freq=rotary_max_freq,
+            cache_if_possible=True,
+            spatial_sequence_shape=self.x_embedder.grid_size,
+        )
+        self.temporal_rotary_emb = RotaryEmbedding(
+            dim=hidden_size // num_heads,
+            cache_if_possible=True,
+            temporal_context_length=context_window_size,
+        )
+
+        ## aggregation block
+        if aggregation_config is not None:
+            # Depth stacking never uses the legacy cross-attention RoPE.
+            self.cross_raster_emb = None
+            #initialize rasterizer
+
+            if self.learned_padding == False:
+                background_feature = torch.zeros(raster_cond_shape[0])  # (1, 1, C)
+                self.register_buffer("background_feature", background_feature, persistent=False)
+            else:
+                logger.info("Learned Padding Mode")
+                self.background_feature = nn.Parameter(torch.ones(raster_cond_shape[0]), requires_grad=True)
+                self.detach_raster_grad = False
+
+            from .voxel_rasterizer import VoxelMeshRasterizer
+            self.rasterizer = VoxelMeshRasterizer(
+                dim=self.voxel_dim,
+                height=raster_cond_shape[1],
+                width=raster_cond_shape[2],
+                max_layers=self.voxel_dim*4,
+            )
+        else:
+            self.cross_raster_emb = None
+            self.rasterizer = None
+
+        self.blocks = nn.ModuleList(
+            [
+                SpatioTemporalPixelDiTBlock(
+                    hidden_size,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    is_causal=is_causal,
+                    causal_block_size=causal_block_size,
+                    qk_rms_norm=qk_rms_norm,
+                    flash_attn=self.flash_attn,
+                    pixel_spatial_emb=self.pixel_spatial_emb,
+                    temporal_rotary_emb=self.temporal_rotary_emb,
+                )
+                for _ in range(depth)
+            ]
+        )
+        self.player_fusion_blocks = nn.ModuleList(
+            [
+                SpatioTemporalPixelDiTBlock(
+                    hidden_size,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    is_causal=False,
+                    causal_block_size=causal_block_size,
+                    qk_rms_norm=qk_rms_norm,
+                    flash_attn=self.flash_attn,
+                    pixel_spatial_emb=self.pixel_spatial_emb,
+                    temporal_rotary_emb=self.temporal_rotary_emb,
+                )
+                for _ in range(self.player_fusion_depth)
+            ]
+        )
+
+        self.final_layer = PixelFinalLayer(hidden_size, patch_size, self.out_channels)
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+
+        self.apply(_basic_init)
+
+        # Preserve the pretrained denoiser exactly until the new condition-mask
+        # path starts learning.  This also keeps old checkpoints loadable with
+        # strict=False without changing x_embedder's input-channel shape.
+        if self.condition_mask_embedder is not None:
+            nn.init.constant_(self.condition_mask_embedder.weight, 0)
+            nn.init.constant_(self.condition_mask_embedder.bias, 0)
+        if self.extra_condition_embedder is not None:
+            nn.init.constant_(self.extra_condition_embedder.weight, 0)
+            nn.init.constant_(self.extra_condition_embedder.bias, 0)
+        if self.other_player_orientation_embedder is not None:
+            # Preserve the action-only function at warm start while allowing
+            # the absolute heading route to begin learning immediately.
+            nn.init.constant_(self.other_player_orientation_embedder.weight, 0)
+        if self.roi_appearance_token_embedder is not None:
+            # Fresh models start as an exact no-op while the output projection
+            # still receives a first-step gradient. Warm starts migrate the old
+            # joint appearance slice into this factorized 256-token branch.
+            nn.init.constant_(self.roi_appearance_token_embedder[1].weight, 0)
+        if self.oracle_player_geometry_embedder is not None:
+            # Exact warm start: the target-derived diagnostic condition begins
+            # as a no-op and receives a gradient on its first training step.
+            nn.init.constant_(self.oracle_player_geometry_embedder.weight, 0)
+            nn.init.constant_(self.oracle_player_geometry_embedder.bias, 0)
+        if self.actor_condition_embedder is not None:
+            nn.init.constant_(self.actor_condition_embedder.weight, 0)
+            nn.init.constant_(self.actor_condition_embedder.bias, 0)
+        if self.condition_reinjectors is not None:
+            # This makes an old checkpoint an exact functional warm start.
+            for adapter in self.condition_reinjectors:
+                nn.init.constant_(adapter[-1].weight, 0)
+                nn.init.constant_(adapter[-1].bias, 0)
+        if self.appearance_reinjectors is not None:
+            for adapter in self.appearance_reinjectors:
+                nn.init.constant_(adapter.to_output.weight, 0)
+                nn.init.constant_(adapter.to_output.bias, 0)
+        if self.appearance_detail_reinjectors is not None:
+            # Exact warm start: the existing appearance path is unchanged until
+            # the new detail adapters learn to use sub-patch features.
+            for adapter in self.appearance_detail_reinjectors:
+                nn.init.constant_(adapter.to_output.weight, 0)
+                nn.init.constant_(adapter.to_output.bias, 0)
+        if self.entity_reference_adapters is not None:
+            for adapter in self.entity_reference_adapters:
+                nn.init.constant_(adapter.to_output.weight, 0)
+                nn.init.constant_(adapter.to_output.bias, 0)
+        if self.unified_reference_adapter is not None:
+            nn.init.constant_(self.unified_reference_adapter.to_output.weight, 0)
+            nn.init.constant_(self.unified_reference_adapter.to_output.bias, 0)
+        if self.parallel_player_adapter is not None:
+            nn.init.constant_(self.parallel_player_adapter[-1].weight, 0)
+            nn.init.constant_(self.parallel_player_adapter[-1].bias, 0)
+        if self.parallel_player_fusion_module is not None:
+            nn.init.constant_(self.parallel_player_fusion_module[1].bias, 0)
+            nn.init.constant_(self.parallel_player_fusion_module[-1].weight, 0)
+            nn.init.constant_(self.parallel_player_fusion_module[-1].bias, 0)
+
+        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+        w = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # Zero-out adaLN modulation layers in DiT blocks:
+        for block in self.blocks:
+            nn.init.constant_(block.s_adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.s_adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(block.t_adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.t_adaLN_modulation[-1].bias, 0)
+        # A small nonzero residual gate gives every new fusion parameter a
+        # first-step gradient while keeping a warm-started renderer close to
+        # its established scene function. Warm-start migration replaces the
+        # remaining weights with copies of the first pretrained DiT blocks.
+        for block in self.player_fusion_blocks:
+            for modulation in (
+                block.s_adaLN_modulation[-1], block.t_adaLN_modulation[-1]
+            ):
+                nn.init.constant_(modulation.weight, 0)
+                nn.init.constant_(modulation.bias, 0)
+                width = modulation.bias.numel() // 6
+                modulation.bias.data[2 * width:3 * width].fill_(0.01)
+                modulation.bias.data[5 * width:6 * width].fill_(0.01)
+
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def _initialize_kv_caches(self, batch_size=None, dtype=None):
+        patched_pix_shape = self.x_embedder.grid_size
+        H, W = patched_pix_shape
+        head_dim = self.hidden_size // self.num_heads
+        device = self.x_embedder.proj.weight.device
+        dtype = dtype or self.x_embedder.proj.weight.dtype
+
+        if batch_size is not None:
+            self.batch_size = batch_size
+        if self.batch_size is None:
+            raise ValueError("batch_size is required to initialize KV caches")
+
+        self.kv_caches = []
+        for _ in range(self.depth):
+            cache_shape = (self.batch_size * H * W, self.num_heads, self.cache_window_size, head_dim)
+            kv_cache = {
+                "k": torch.zeros(cache_shape, device=device, dtype=dtype),
+                "v": torch.zeros(cache_shape, device=device, dtype=dtype),
+                "global_end_index": torch.tensor(0, dtype=torch.long, device=device),
+                "local_end_index": torch.tensor(0, dtype=torch.long, device=device),
+            }
+            self.kv_caches.append(kv_cache)
+        self.raster_cache = {"raster_cond": None, "global_start_idx": -1}
+
+    def init_kv_cache(self, batch_size, dtype=None):
+        """Allocate caches in the active inference dtype."""
+        self._initialize_kv_caches(batch_size=batch_size, dtype=dtype)
+        return self.kv_caches
+
+    def commit_kv_candidates(self, candidates, frame_index):
+        """Atomically commit one final-denoise candidate per temporal block."""
+        if self.kv_caches is None:
+            raise RuntimeError("init_kv_cache must be called before commit")
+        if len(candidates) != len(self.kv_caches):
+            raise ValueError("candidate count must match temporal block count")
+        expected_indices = {
+            int(cache["global_end_index"].item()) for cache in self.kv_caches
+        }
+        if expected_indices != {frame_index}:
+            raise ValueError(
+                f"All layers must expect frame_index={frame_index}, got {expected_indices}"
+            )
+        for cache, (current_k, current_v) in zip(self.kv_caches, candidates):
+            commit_current_kv(cache, current_k, current_v, frame_index)
+
+    def _reset_kv_cache_indices(self):
+        """Reset KV cache indices to zero without reallocating buffers.
+
+        Called before a prefill pass so the entire current window is
+        written fresh into the cache.
+        """
+        if self.kv_caches:
+            for cache in self.kv_caches:
+                cache["global_end_index"].fill_(0)
+                cache["local_end_index"].fill_(0)
+
+    def unpatchify(self, x):
+        """
+        x: (N, H, W, patch_size**2 * C)
+        vox: (N, H, W, C)
+        """
+        c = self.out_channels
+        p_h, p_w = self.x_embedder.patch_size
+        H, W = x.shape[1:3]
+
+        x = x.reshape(shape=(x.shape[0], H, W, p_h, p_w, c))
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        vox = x.reshape(shape=(x.shape[0], c, H * p_h, W * p_w))
+        return vox
+
+    def _fuse_parallel_player_tokens(
+        self, x, player_tokens, strength=1.0, player_mask=None
+    ):
+        """Fuse player tokens without discarding a pretrained additive branch.
+
+        The explicit skip starts at one, so a player-only checkpoint remains
+        functionally useful when the FiLM module is introduced. The zero-
+        initialized FiLM output learns a correction instead of becoming a
+        randomly initialized bottleneck between the player branch and DiT.
+        """
+        strength = torch.as_tensor(strength, dtype=x.dtype, device=x.device)
+        if self.parallel_player_masked_fusion:
+            if player_mask is None:
+                raise ValueError("masked player fusion requires a player token mask")
+            player_tokens = player_tokens * player_mask.to(player_tokens.dtype)
+        if self.parallel_player_fusion_module is None:
+            return x + strength * player_tokens
+        scale, shift = self.parallel_player_fusion_module(player_tokens).chunk(2, dim=-1)
+        player_delta = (
+            scale.tanh() * self.parallel_player_environment_norm(x) + shift
+        )
+        if self.parallel_player_masked_fusion:
+            player_delta = player_delta * player_mask.to(player_delta.dtype)
+        return x + strength * (
+            self.parallel_player_skip_gate.to(x.dtype) * player_tokens
+            + self.parallel_player_fusion_gate.tanh().to(x.dtype) * player_delta
+        )
+
+    def project_raster(self, external_cond, dtype):
+        # A projection belongs to this call's state, never merely to a frame index.
+        if "raster_features" in external_cond:
+            raster_cond = external_cond["raster_features"]
+            raster_depth = external_cond["raster_depth"]
+            raster_cond = rearrange(raster_cond, "b t h w l c -> (b t) h w l c")
+            raster_depth = rearrange(raster_depth, "b t h w l -> (b t) h w l")
+        else:
+            if self.rasterizer is None:
+                raise ValueError("provide raster_features/raster_depth or enable GPU rasterization")
+            voxel_latents, camera = external_cond['voxel_latents'], external_cond['camera']
+            view, proj = camera_params_to_matrices(camera, image_width=self.input_w, image_height=self.input_h)
+            voxel_latents = rearrange(voxel_latents, "b t c x y z -> (b t) (x y z) c")
+            view = rearrange(view, "b t p q -> (b t) p q")
+            proj = rearrange(proj, "b t p q -> (b t) p q")
+            raster_cond, raster_depth = self.rasterizer.rasterize(
+                voxel_latents, view, proj, self.background_feature)
+            raster_cond = rearrange(raster_cond, "l bt h w c -> bt h w l c")
+            raster_depth = rearrange(raster_depth, "l bt h w -> bt h w l")
+        raster_cond = self.depth_embedder(raster_cond.to(dtype), raster_depth.to(dtype))
+        raster_cond = rearrange(raster_cond, 'bt h w l c -> bt (l c) h w')
+
+        return raster_cond
+
+    def _spatial_other_player_tokens(self, external_cond, token_size, dtype):
+        """Embed each resident's action/heading and route it to that resident's ROI."""
+        actions=external_cond.get("other_player_action")
+        routing=external_cond.get("other_player_routing")
+        if actions is None or routing is None:
+            raise ValueError(
+                "split player conditioning requires per-player action and routing"
+            )
+        b,t,a,action_dim=actions.shape
+        if action_dim != self.action_embedder.in_features:
+            raise ValueError("other-player action dimension does not match action embedder")
+        if routing.shape[:3] != (b,t,a) or routing.ndim != 5:
+            raise ValueError("other-player routing must be [B,T,A,H,W]")
+
+        routing=routing.to(dtype)
+        pooled=F.adaptive_avg_pool2d(
+            routing.flatten(0,2).unsqueeze(1),token_size
+        ).squeeze(1).reshape(b,t,a,*token_size)
+        union=F.adaptive_max_pool2d(
+            routing.amax(2).flatten(0,1).unsqueeze(1),token_size
+        ).squeeze(1).reshape(b,t,*token_size)
+        # Pooling can make two residents occupy the same token even when their
+        # pixel masks do not overlap. Renormalize per token and retain only the
+        # union occupancy, so condition magnitude does not grow with crowd size.
+        weights=pooled/pooled.sum(2,keepdim=True).clamp_min(1e-6)
+        weights=weights*union[:,:,None]
+        action_embedder = (
+            self.other_player_action_embedder
+            if self.other_player_action_embedder is not None
+            else self.action_embedder
+        )
+        features=action_embedder(actions.to(dtype))
+        if self.other_player_action_orientation_only:
+            orientation=external_cond.get("other_player_orientation")
+            if orientation is None or orientation.shape != (b,t,a,4):
+                raise ValueError(
+                    "other-player orientation must be [B,T,A,4]"
+                )
+            if self.other_player_orientation_embedder is None:
+                raise ValueError("other-player orientation embedder is unavailable")
+            features=features+self.other_player_orientation_embedder(
+                orientation.to(dtype)
+            )
+        elif not self.other_player_action_only:
+            states=external_cond.get("other_player_state")
+            if states is None or states.shape[:3] != (b,t,a):
+                raise ValueError("other-player state must be [B,T,A,D]")
+            if self.extra_condition_embedder is None:
+                raise ValueError(
+                    "split player conditioning requires resident state embedding"
+                )
+            features=features+self.extra_condition_embedder(states.to(dtype))
+        motion = external_cond.get("other_player_motion")
+        if motion is not None and (
+            self.other_player_action_only or self.other_player_action_orientation_only
+        ):
+            # Full-state mode already includes motion in other_player_state.
+            # Reuse the target's state projection but NOT its bias: zero motion
+            # must be an exactly zero residual for checkpoint compatibility.
+            if self.extra_condition_embedder is None or motion.shape != (
+                b, t, a, self.extra_condition_embedder.in_features
+            ):
+                raise ValueError("other-player motion must match condition_dim")
+            features = features + F.linear(
+                motion.to(dtype), self.extra_condition_embedder.weight, bias=None
+            )
+        return torch.einsum("btahw,btad->bthwd",weights,features)
+
+    def _player_token_support(self, external_cond, token_size, dtype):
+        """Return an inference-available per-frame union of routed player ROIs."""
+        routing = external_cond.get("other_player_routing")
+        if routing is None or routing.ndim != 5:
+            raise ValueError("player token support requires [B,T,A,H,W] routing")
+        b, t = routing.shape[:2]
+        support = F.adaptive_max_pool2d(
+            routing.amax(2).flatten(0, 1).unsqueeze(1).to(dtype), token_size
+        )
+        support = support.reshape(b, t, *token_size, 1)
+        return (support > 0).to(dtype)
+
+    def forward(
+        self,
+        x,
+        t,
+        external_cond=None,
+        global_start_idx=None,
+        prefill=False,
+        return_features=False,
+        cache_write=True,
+        return_kv_candidates=False,
+        block_callback=None,
+    ):
+        """
+        Forward pass of DiT.
+        x: (B, T, C, H, W) tensor of spatial inputs (pix or latent pix)
+        t: (B, T,) tensor of diffusion timesteps
+        prefill: if True, enables causal masking with KV cache for multi-frame prefill passes
+        """
+        if global_start_idx is None:
+            global_start_idx = 0
+
+        B, T, C, H, W = x.shape
+
+        raster_cond = external_cond.get("raster_embedding")
+        if raster_cond is None:
+            raster_cond = self.project_raster(external_cond, x.dtype)
+
+        condition_tokens = None
+        if self.deep_condition_reinjection:
+            # Reuse the trained raster slice of the patch embedder so a warm
+            # start already has meaningful aligned 3D condition tokens.
+            raster_tokens = F.conv2d(
+                raster_cond,
+                self.x_embedder.proj.weight[:, self.in_channels:],
+                bias=None,
+                stride=self.x_embedder.proj.stride,
+                padding=self.x_embedder.proj.padding,
+                dilation=self.x_embedder.proj.dilation,
+                groups=self.x_embedder.proj.groups,
+            )
+            condition_tokens = rearrange(
+                raster_tokens, "(b t) d h w -> b t h w d", b=B, t=T
+            )
+
+        # Dense scene evidence and ROI-attended resident maps enter one joint
+        # local projection before any DiT block.
+        x = rearrange(x, "b t c h w -> (b t) c h w")
+        joint_inputs = [x, raster_cond]
+        if self.simple_conditioning:
+            actor_condition = external_cond.get("actor_spatial_condition")
+            expected_actor = (B, T, self.actor_condition_dim, H, W)
+            if actor_condition is None or tuple(actor_condition.shape) != expected_actor:
+                raise ValueError(
+                    f"actor_spatial_condition must have shape {expected_actor}"
+                )
+            appearance_condition = external_cond.get("roi_appearance_condition")
+            expected_appearance = (B, T, self.roi_appearance_dim, H, W)
+            if (
+                appearance_condition is None
+                or tuple(appearance_condition.shape) != expected_appearance
+            ):
+                raise ValueError(
+                    "roi_appearance_condition must have shape "
+                    f"{expected_appearance}"
+                )
+            joint_inputs.extend(
+                (
+                    rearrange(
+                        actor_condition, "b t c h w -> (b t) c h w"
+                    ).to(x.dtype),
+                    rearrange(
+                        (
+                            torch.zeros_like(appearance_condition)
+                            if (
+                                self.parallel_player_feature
+                                or self.independent_roi_appearance_tokens
+                            )
+                            else appearance_condition
+                        ),
+                        "b t c h w -> (b t) c h w",
+                    ).to(x.dtype),
+                )
+            )
+        x = torch.cat(joint_inputs, dim=1)
+        x = self.x_embedder(x)
+        appearance_token_delta = None
+        if self.roi_appearance_token_embedder is not None:
+            appearance_flat = rearrange(
+                appearance_condition, "b t c h w -> (b t) c h w"
+            ).to(x.dtype)
+            appearance_token_delta = self.roi_appearance_token_embedder(
+                appearance_flat
+            )
+            appearance_token_delta = rearrange(
+                appearance_token_delta, "bt d h w -> bt h w d"
+            )
+            if not self.roi_appearance_condition_blocks:
+                x = x + (
+                    self.roi_appearance_token_gate.to(x.dtype)
+                    * appearance_token_delta
+                )
+        if self.oracle_player_geometry_embedder is not None:
+            oracle_geometry = external_cond.get("oracle_player_geometry")
+            expected_geometry = (B, T, 2, H, W)
+            if oracle_geometry is None or tuple(oracle_geometry.shape) != expected_geometry:
+                raise ValueError(
+                    "oracle_player_geometry must have shape "
+                    f"{expected_geometry}"
+                )
+            geometry_tokens = self.oracle_player_geometry_embedder(
+                rearrange(
+                    oracle_geometry, "b t c h w -> (b t) c h w"
+                ).to(x.dtype)
+            )
+            x = x + rearrange(
+                geometry_tokens, "bt d h w -> bt h w d"
+            )
+
+        actor_tokens = None
+        if self.actor_condition_embedder is not None:
+            actor_condition = external_cond.get("actor_spatial_condition")
+            if actor_condition is None:
+                raise ValueError("actor_spatial_condition is required when actor_condition_dim > 0")
+            if actor_condition.shape[:2] != (B, T) or actor_condition.shape[-2:] != (H, W):
+                raise ValueError(
+                    "actor_spatial_condition must be [B,T,C,H,W] with "
+                    f"B,T,H,W={(B, T, H, W)}, got {tuple(actor_condition.shape)}"
+                )
+            actor_tokens = self.actor_condition_embedder(
+                rearrange(actor_condition, "b t c h w -> (b t) c h w").to(x.dtype)
+            )
+            x = x + rearrange(actor_tokens, "bt d h w -> bt h w d")
+            if condition_tokens is not None:
+                condition_tokens = condition_tokens + rearrange(
+                    actor_tokens, "(b t) d h w -> b t h w d", b=B, t=T
+                )
+
+        x = rearrange(x, "(b t) h w d -> b t h w d", b=B, t=T)
+        roi_appearance_tokens = (
+            rearrange(
+                appearance_token_delta,
+                "(b t) h w d -> b t h w d",
+                b=B,
+                t=T,
+            )
+            if appearance_token_delta is not None else None
+        )
+        appearance_tokens = None
+        appearance_mask = None
+        appearance_detail_tokens = None
+        appearance_detail_mask = None
+        entity_reference = None
+        entity_reference_roi = None
+        if self.appearance_condition_embedder is not None:
+            appearance_condition = external_cond.get("appearance_spatial_condition")
+            expected = (
+                B,
+                T,
+                self.appearance_condition_embedder[0].in_channels,
+                H,
+                W,
+            )
+            if appearance_condition is None or tuple(appearance_condition.shape) != expected:
+                raise ValueError(f"appearance_spatial_condition must have shape {expected}")
+            appearance_flat = rearrange(
+                appearance_condition, "b t c h w -> (b t) c h w"
+            ).to(x.dtype)
+            appearance_tokens = self.appearance_condition_embedder(appearance_flat)
+            if self.appearance_detail_embedder is not None:
+                appearance_detail_tokens = rearrange(
+                    self.appearance_detail_embedder(appearance_flat),
+                    "(b t) d h w -> b t h w d", b=B, t=T
+                )
+                appearance_detail_mask = F.max_pool2d(
+                    appearance_flat[:, 3:4], self.patch_size, self.patch_size
+                ).clamp(0, 1)
+                appearance_detail_mask = rearrange(
+                    appearance_detail_mask, "(b t) c h w -> b t h w c", b=B, t=T
+                )
+            appearance_tokens = rearrange(
+                appearance_tokens, "(b t) d h w -> b t h w d", b=B, t=T
+            )
+            appearance_mask = F.avg_pool2d(
+                appearance_flat[:, 3:4], self.patch_size, self.patch_size
+            ).clamp(0, 1)
+            appearance_mask = rearrange(
+                appearance_mask, "(b t) c h w -> b t h w c", b=B, t=T
+            )
+        if self.entity_reference_adapters is not None:
+            reference = external_cond.get("entity_reference_tokens")
+            view_weights = external_cond.get("entity_reference_view_weights")
+            roi = external_cond.get("entity_reference_roi")
+            if reference is None or reference.ndim != 5 or reference.shape[0] != B:
+                raise ValueError("entity_reference_tokens must be [B,A,V,N,D]")
+            if view_weights is None or roi is None:
+                raise ValueError("entity reference layout tensors are required")
+            if view_weights.shape[:3] != (B, T, reference.shape[1]):
+                raise ValueError("entity_reference_view_weights must be [B,T,A,V]")
+            if roi.shape != (B, T, reference.shape[1], H, W):
+                raise ValueError("entity_reference_roi must be [B,T,A,H,W]")
+            entity_reference = torch.einsum(
+                "btav,bavnd->btand", view_weights.to(x.dtype), reference.to(x.dtype)
+            )
+            entity_reference_roi = F.max_pool2d(
+                roi.flatten(0, 2).unsqueeze(1).to(x.dtype), self.patch_size, self.patch_size
+            )
+            # One-token expansion tolerates pose and bbox errors without making
+            # the identity reference globally accessible.
+            entity_reference_roi = F.max_pool2d(entity_reference_roi, 3, 1, 1)
+            entity_reference_roi = entity_reference_roi.squeeze(1).unflatten(
+                0, (B, T, reference.shape[1])
+            )
+        unified_reference = None
+        unified_reference_roi = None
+        unified_reference_valid = None
+        unified_reference_view_weights = None
+        unified_reference_local_coordinates = None
+        if self.unified_reference_adapter is not None:
+            reference = external_cond.get("unified_reference_tokens")
+            roi = external_cond.get("unified_reference_roi")
+            valid = external_cond.get("unified_reference_valid")
+            if reference is None or roi is None or valid is None:
+                raise ValueError("unified reference tokens, ROI and valid mask are required")
+            if roi.shape[:3] != (B, T, reference.shape[1]) or roi.shape[-2:] != (H, W):
+                raise ValueError("unified_reference_roi must be [B,T,A,H,W]")
+            unified_reference_roi = F.max_pool2d(
+                roi.flatten(0, 2).unsqueeze(1).to(x.dtype),
+                self.patch_size,
+                self.patch_size,
+            )
+            unified_reference_roi = F.max_pool2d(
+                unified_reference_roi, 3, 1, 1
+            )
+            unified_reference_roi = unified_reference_roi.squeeze(1).unflatten(
+                0, (B, T, reference.shape[1])
+            )
+            unified_reference = reference.to(x.dtype)
+            unified_reference_valid = valid.bool()
+            if self.unified_reference_adapter.geometry_aware:
+                view_weights = external_cond.get("unified_reference_view_weights")
+                local_coordinates = external_cond.get(
+                    "unified_reference_local_coordinates"
+                )
+                if view_weights is None or local_coordinates is None:
+                    raise ValueError(
+                        "geometry-aware unified reference layout tensors are required"
+                    )
+                unified_reference_view_weights = view_weights.to(x.dtype)
+                local_coordinates = rearrange(
+                    local_coordinates,
+                    "b t a h w c -> (b t a) c h w",
+                ).to(x.dtype)
+                local_coordinates = F.avg_pool2d(
+                    local_coordinates, self.patch_size, self.patch_size
+                )
+                unified_reference_local_coordinates = rearrange(
+                    local_coordinates,
+                    "(b t a) c h w -> b t a h w c",
+                    b=B,
+                    t=T,
+                    a=reference.shape[1],
+                )
+            if self.gradient_checkpointing and self.training:
+                reference_delta = checkpoint(
+                    lambda x_, reference_, roi_, valid_: self.unified_reference_adapter(
+                        x_, reference_, roi_, valid_,
+                        unified_reference_view_weights,
+                        unified_reference_local_coordinates,
+                    ),
+                    x,
+                    unified_reference,
+                    unified_reference_roi,
+                    unified_reference_valid,
+                    use_reentrant=False,
+                )
+            else:
+                reference_delta = self.unified_reference_adapter(
+                    x,
+                    unified_reference,
+                    unified_reference_roi,
+                    unified_reference_valid,
+                    unified_reference_view_weights,
+                    unified_reference_local_coordinates,
+                )
+            x = x + reference_delta
+        # embed noise steps
+        t = rearrange(t, "b t -> (b t)")
+        c = self.t_embedder(t)  # (N, D)
+        c = rearrange(c, "(b t) d -> b t d", b=B, t=T)
+        state_condition = torch.zeros_like(c)
+
+        if self.condition_mask_embedder is not None:
+            condition_mask = external_cond.get("condition_mask")
+            if condition_mask is None:
+                condition_mask = torch.zeros((B, T), device=x.device, dtype=x.dtype)
+            if condition_mask.shape != (B, T):
+                raise ValueError(
+                    f"condition_mask must have shape {(B, T)}, got {tuple(condition_mask.shape)}"
+                )
+            mask_embedding = self.condition_mask_embedder(condition_mask.to(x.dtype).unsqueeze(-1))
+            x = x + mask_embedding[:, :, None, None, :]
+
+        if external_cond:
+            action_cond = external_cond['action']
+            action_embedding = self.action_embedder(action_cond)
+            c += action_embedding
+            state_condition += action_embedding
+            action_prefix_mask = external_cond.get("action_prefix_mask")
+            if action_prefix_mask is not None:
+                if action_prefix_mask.shape != (B, T):
+                    raise ValueError(
+                        f"action_prefix_mask must have shape {(B, T)}, "
+                        f"got {tuple(action_prefix_mask.shape)}"
+                    )
+                prefix_embedding = (
+                    action_prefix_mask.to(c.dtype).unsqueeze(-1)
+                    * self.window_prefix_embedding.to(c.dtype)
+                )
+                c += prefix_embedding
+                state_condition += prefix_embedding
+            if self.extra_condition_embedder is not None:
+                extra_condition = external_cond.get("extra_condition")
+                if extra_condition is not None:
+                    if extra_condition.shape[:2] != (B, T):
+                        raise ValueError(
+                            "extra_condition must start with shape "
+                            f"{(B, T)}, got {tuple(extra_condition.shape)}"
+                        )
+                    extra_embedding = self.extra_condition_embedder(extra_condition.to(c.dtype))
+                    c += extra_embedding
+                    state_condition += extra_embedding
+        if condition_tokens is not None:
+            hud_condition = external_cond.get("hud_condition")
+            expected_hud = (B, T, self.hud_condition_embedder.in_channels, H, W)
+            if hud_condition is None or tuple(hud_condition.shape) != expected_hud:
+                raise ValueError(f"hud_condition must have shape {expected_hud}")
+            hud_tokens = self.hud_condition_embedder(
+                rearrange(hud_condition, "b t c h w -> (b t) c h w").to(x.dtype)
+            )
+            condition_tokens = condition_tokens + rearrange(
+                hud_tokens, "(b t) d h w -> b t h w d", b=B, t=T
+            )
+            condition_tokens = condition_tokens + state_condition[:, :, None, None]
+        # Convert to tensor for torch.compile compatibility (avoids dynamo guards on int values)
+        global_start_idx_t = torch.tensor(global_start_idx, device=x.device)
+        player_tokens = None
+        if self.parallel_player_adapter is not None:
+            player_tokens = self.parallel_player_adapter(
+                rearrange(
+                    appearance_condition, "b t c h w -> (b t) c h w"
+                ).to(x.dtype)
+            )
+            player_tokens = rearrange(
+                player_tokens, "(b t) d h w -> b t h w d", b=B, t=T
+            )
+        other_player_tokens = None
+        if self.split_player_conditioning:
+            other_player_tokens=self._spatial_other_player_tokens(
+                external_cond,x.shape[2:4],x.dtype
+            )
+        player_token_support = None
+        if self.parallel_player_masked_fusion or self.mask_player_temporal_attention:
+            player_token_support = self._player_token_support(
+                external_cond, x.shape[2:4], x.dtype
+            )
+        temporal_output_mask = None
+        if self.mask_player_temporal_attention:
+            # Suppress temporal updates along the complete screen-space player
+            # trajectory, including positions occupied in another frame. This
+            # prevents a moving player from leaving temporal residuals behind.
+            player_tube = player_token_support.amax(dim=1, keepdim=True)
+            temporal_output_mask = 1 - player_tube.expand(-1, T, -1, -1, -1)
+        if self.player_fusion_blocks:
+            # In this mode every explicit other-player token enters before the
+            # frozen scene trunk. The legacy block-0/4/8 injection below is
+            # skipped, so action/orientation cannot bypass these fusion blocks.
+            for fusion_block in self.player_fusion_blocks:
+                x = x + other_player_tokens / len(self.player_fusion_blocks)
+                if self.gradient_checkpointing and self.training:
+                    x = checkpoint(
+                        lambda x_, c_, block_=fusion_block: block_(
+                            x_, c_, temporal_output_mask=temporal_output_mask
+                        ),
+                        x,
+                        c,
+                        use_reentrant=False,
+                    )
+                else:
+                    x = fusion_block(
+                        x, c, temporal_output_mask=temporal_output_mask
+                    )
+        kv_candidates = []
+        for i, block in enumerate(self.blocks):
+            block_c = c
+            if not self.player_fusion_blocks and i in self.other_player_condition_blocks:
+                if self.other_player_condition_gates is None:
+                    player_delta = other_player_tokens / len(
+                        self.other_player_condition_blocks
+                    )
+                else:
+                    action_gate = self._other_player_condition_gate[i]
+                    player_delta = self.other_player_condition_gates[
+                        action_gate
+                    ].tanh().to(x.dtype) * other_player_tokens
+                if self.other_player_roi_adaln:
+                    # The main condition remains global; resident action/heading
+                    # changes the SAME spatial and temporal AdaLN only in its ROI.
+                    # No token residual is added in this mode. Attention can
+                    # subsequently propagate effects outside the injection ROI.
+                    block_c = c[:, :, None, None, :] + player_delta
+                else:
+                    x = x + player_delta
+            appearance_condition_gate = self._roi_appearance_condition_gate.get(i)
+            if appearance_condition_gate is not None:
+                if roi_appearance_tokens is None:
+                    raise ValueError(
+                        "early ROI appearance conditioning requires appearance tokens"
+                    )
+                x = x + (
+                    self.roi_appearance_token_gate.to(x.dtype)
+                    * self.roi_appearance_condition_gates[
+                        appearance_condition_gate
+                    ].tanh().to(x.dtype)
+                    * roi_appearance_tokens
+                )
+            if player_tokens is not None and i == self.parallel_player_feature_block:
+                x = self._fuse_parallel_player_tokens(
+                    x, player_tokens, player_mask=player_token_support
+                )
+            if (
+                player_tokens is not None
+                and i in self.parallel_player_feature_blocks
+            ):
+                x = self._fuse_parallel_player_tokens(
+                    x,
+                    player_tokens,
+                    strength=1.0 / len(self.parallel_player_feature_blocks),
+                    player_mask=player_token_support,
+                )
+            appearance_gate = self._roi_appearance_reinject_gate.get(i)
+            if appearance_gate is not None:
+                if roi_appearance_tokens is None:
+                    raise ValueError(
+                        "ROI appearance reinjection requires appearance tokens"
+                    )
+                x = x + self.roi_appearance_reinject_gates[
+                    appearance_gate
+                ].tanh().to(x.dtype) * roi_appearance_tokens
+            reinjection_gate = self._unified_reference_reinject_gate.get(i)
+            if reinjection_gate is not None:
+                adapter = self.unified_reference_adapter
+                if self.gradient_checkpointing and self.training:
+                    reference_delta = checkpoint(
+                        lambda x_, reference_, roi_, valid_: adapter(
+                            x_, reference_, roi_, valid_,
+                            unified_reference_view_weights,
+                            unified_reference_local_coordinates,
+                        ),
+                        x,
+                        unified_reference,
+                        unified_reference_roi,
+                        unified_reference_valid,
+                        use_reentrant=False,
+                    )
+                else:
+                    reference_delta = adapter(
+                        x,
+                        unified_reference,
+                        unified_reference_roi,
+                        unified_reference_valid,
+                        unified_reference_view_weights,
+                        unified_reference_local_coordinates,
+                    )
+                gate = adapter.reinjection_gates[reinjection_gate].tanh().to(x.dtype)
+                x = x + gate * reference_delta
+            if self.condition_reinjectors is not None:
+                x = x + self.condition_reinjectors[i](condition_tokens)
+            if self.appearance_reinjectors is not None:
+                adapter = self.appearance_reinjectors[i]
+                if self.gradient_checkpointing and self.training:
+                    appearance_delta = checkpoint(
+                        lambda x_, reference_, mask_, adapter_=adapter: adapter_(
+                            x_, reference_, mask_
+                        ),
+                        x,
+                        appearance_tokens,
+                        appearance_mask,
+                        use_reentrant=False,
+                    )
+                else:
+                    appearance_delta = adapter(x, appearance_tokens, appearance_mask)
+                x = x + appearance_delta
+            if self.appearance_detail_reinjectors is not None:
+                detail_adapter = self.appearance_detail_reinjectors[i]
+                if self.gradient_checkpointing and self.training:
+                    detail_delta = checkpoint(
+                        lambda x_, reference_, mask_, adapter_=detail_adapter: adapter_(
+                            x_, reference_, mask_
+                        ),
+                        x,
+                        appearance_detail_tokens,
+                        appearance_detail_mask,
+                        use_reentrant=False,
+                    )
+                else:
+                    detail_delta = detail_adapter(
+                        x, appearance_detail_tokens, appearance_detail_mask
+                    )
+                x = x + detail_delta
+            if self.entity_reference_adapters is not None:
+                reference_adapter = self.entity_reference_adapters[i]
+                if self.gradient_checkpointing and self.training:
+                    reference_delta = checkpoint(
+                        lambda x_, reference_, roi_, adapter_=reference_adapter: adapter_(
+                            x_, reference_, roi_
+                        ),
+                        x, entity_reference, entity_reference_roi, use_reentrant=False,
+                    )
+                else:
+                    reference_delta = reference_adapter(
+                        x, entity_reference, entity_reference_roi
+                    )
+                x = x + reference_delta
+            cache = self.kv_caches[i] if self.kv_caches else None
+            if self.gradient_checkpointing and self.training and cache is None:
+                x = checkpoint(
+                    lambda x_, c_, block_=block: block_(
+                        x_,
+                        c_,
+                        kv_cache=None,
+                        global_start_idx=global_start_idx_t,
+                        prefill=prefill,
+                        temporal_output_mask=temporal_output_mask,
+                    ),
+                    x,
+                    block_c,
+                    use_reentrant=False,
+                )
+            else:
+                block_result = block(
+                    x,
+                    block_c,
+                    kv_cache=cache,
+                    global_start_idx=global_start_idx_t,
+                    prefill=prefill,
+                    cache_write=cache_write,
+                    return_kv_candidate=return_kv_candidates,
+                    temporal_output_mask=temporal_output_mask,
+                )
+                if return_kv_candidates:
+                    x, candidate = block_result
+                    kv_candidates.append(candidate)
+                else:
+                    x = block_result
+            if block_callback is not None:
+                block_callback(i, x)
+
+        if (
+            player_tokens is not None
+            and self.parallel_player_feature_block == -1
+            and not self.parallel_player_feature_blocks
+        ):
+            x = self._fuse_parallel_player_tokens(
+                x, player_tokens, player_mask=player_token_support
+            )
+        features = x
+        x = self.final_layer(x, c)  # (N, T, H, W, patch_size ** 2 * out_channels)
+        # unpatchify
+        x = rearrange(x, "b t h w d -> (b t) h w d")
+        x = self.unpatchify(x)  # (N, out_channels, H, W)
+        x = rearrange(x, "(b t) c h w -> b t c h w", b=B, t=T)
+
+        if return_features and return_kv_candidates:
+            return x, features, kv_candidates
+        if return_features:
+            return x, features
+        if return_kv_candidates:
+            return x, kv_candidates
+        return x
+
+
+
+        return x

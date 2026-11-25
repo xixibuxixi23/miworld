@@ -1,0 +1,530 @@
+"""Lightweight screen-space condition for other players."""
+
+from __future__ import annotations
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+
+class PlayerSpatialCondition(nn.Module):
+    """Project every other player and its features to a soft screen-space box.
+
+    ``source_embedding`` may be static ``[B,A,D]`` appearance features (the
+    legacy renderer) or frame-aligned ``[B,T,A,D]`` state features (M3-Simple).
+    The latter keeps each resident's action/state attached to its projected
+    location instead of globally pooling all other residents.
+    """
+
+    def __init__(
+        self,
+        appearance_dim: int,
+        output_channels: int = 16,
+        height: int = 36,
+        width: int = 64,
+        player_height: float = 1.8,
+        player_aspect: float = 0.45,
+        edge_sharpness: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if output_channels < 2:
+            raise ValueError("output_channels must be at least 2")
+        if appearance_dim < 0:
+            raise ValueError("appearance_dim must be nonnegative")
+        self.output_channels = output_channels
+        self.height = height
+        self.width = width
+        self.player_height = player_height
+        self.player_aspect = player_aspect
+        self.edge_sharpness = edge_sharpness
+        self.appearance_projection = (
+            nn.Linear(appearance_dim, output_channels - 2, bias=False)
+            if appearance_dim
+            else None
+        )
+
+    def _project(self, points, camera_position, forward, right, down, tan_half_fov_x):
+        relative = points - camera_position
+        depth = (relative * forward).sum(dim=-1)
+        camera_x = (relative * right).sum(dim=-1)
+        camera_y = (relative * down).sum(dim=-1)
+        safe_depth = depth.clamp_min(1e-4)
+        tan_half_fov_y = tan_half_fov_x * (self.height / self.width)
+        u = (camera_x / safe_depth / tan_half_fov_x + 1.0) * (self.width - 1) / 2.0
+        v = (camera_y / safe_depth / tan_half_fov_y + 1.0) * (self.height - 1) / 2.0
+        return u, v, depth
+
+    def forward(self, cond: dict, source_embedding: torch.Tensor) -> torch.Tensor:
+        position = cond["player_position"]
+        camera_position = cond["camera_position"]
+        camera_direction = cond["camera_direction"]
+        camera = cond["camera"]
+        player_valid = cond.get("player_valid")
+
+        bsz, timesteps, agents, _ = position.shape
+        if camera_position.shape != position.shape or camera_direction.shape != position.shape:
+            raise ValueError("camera_position and camera_direction must match player_position")
+        if source_embedding.ndim == 3:
+            if source_embedding.shape[:2] != (bsz, agents):
+                raise ValueError("static source embedding must have shape [B,A,D]")
+            source_embedding = source_embedding[:, None].expand(-1, timesteps, -1, -1)
+        elif source_embedding.ndim == 4:
+            if source_embedding.shape[:3] != (bsz, timesteps, agents):
+                raise ValueError(
+                    "frame-aligned source embedding must have shape [B,T,A,D]"
+                )
+        else:
+            raise ValueError("source embedding must be [B,A,D] or [B,T,A,D]")
+        if player_valid is None:
+            player_valid = torch.ones((bsz, timesteps, agents), device=position.device, dtype=torch.bool)
+        else:
+            player_valid = player_valid.to(device=position.device, dtype=torch.bool)
+
+        dtype = position.dtype
+        forward = F.normalize(camera_direction, dim=-1, eps=1e-6)
+        world_down = torch.tensor((0.0, 0.0, -1.0), device=position.device, dtype=dtype)
+        right = F.normalize(torch.cross(world_down.expand_as(forward), forward, dim=-1), dim=-1, eps=1e-6)
+        down = F.normalize(torch.cross(forward, right, dim=-1), dim=-1, eps=1e-6)
+
+        # [B,T,target,source,3]
+        camera_position = camera_position[:, :, :, None]
+        forward_t = forward[:, :, :, None]
+        right_t = right[:, :, :, None]
+        down_t = down[:, :, :, None]
+        feet = position[:, :, None].expand(-1, -1, agents, -1, -1)
+        head = feet.clone()
+        head[..., 2] += self.player_height
+        tan_half_fov_x = torch.tan(camera[..., -1].clamp(0.05, 3.0) / 2.0)[:, :, :, None]
+
+        foot_u, foot_v, foot_depth = self._project(
+            feet, camera_position, forward_t, right_t, down_t, tan_half_fov_x
+        )
+        head_u, head_v, head_depth = self._project(
+            head, camera_position, forward_t, right_t, down_t, tan_half_fov_x
+        )
+        center_u = (foot_u + head_u) / 2.0
+        center_v = (foot_v + head_v) / 2.0
+        box_h = (foot_v - head_v).abs().clamp(1.0, float(self.height))
+        box_w = (box_h * self.player_aspect).clamp(1.0, float(self.width))
+        depth = (foot_depth + head_depth) / 2.0
+
+        grid_y = torch.arange(self.height, device=position.device, dtype=dtype)
+        grid_x = torch.arange(self.width, device=position.device, dtype=dtype)
+        dy = (grid_y.view(1, 1, 1, 1, self.height, 1) - center_v[..., None, None]).abs()
+        dx = (grid_x.view(1, 1, 1, 1, 1, self.width) - center_u[..., None, None]).abs()
+        mask = torch.sigmoid((box_h[..., None, None] / 2.0 - dy) * self.edge_sharpness)
+        mask = mask * torch.sigmoid((box_w[..., None, None] / 2.0 - dx) * self.edge_sharpness)
+
+        source_valid = player_valid[:, :, None, :]
+        target_valid = player_valid[:, :, :, None]
+        not_self = ~torch.eye(agents, device=position.device, dtype=torch.bool)[None, None]
+        visible = source_valid & target_valid & not_self & (depth > 0.05)
+        mask = mask * visible[..., None, None].to(dtype)
+
+        inverse_depth = 1.0 / (1.0 + depth.clamp_min(0.0))
+
+        source_features = [torch.ones_like(depth)[..., None], inverse_depth[..., None]]
+        if self.appearance_projection is not None:
+            projected = torch.tanh(self.appearance_projection(source_embedding.to(dtype)))
+            projected = projected[:, :, None].expand(-1, -1, agents, -1, -1)
+            source_features.append(projected)
+        source_features = torch.cat(source_features, dim=-1)
+        spatial = (mask[..., None, :, :] * source_features[..., :, None, None]).sum(dim=3)
+        return spatial.contiguous()
+
+
+class ViewAwarePlayerAppearance(nn.Module):
+    """Warp four-view RGBA references into the target camera at latent resolution.
+
+    Unlike ``PlayerSpatialCondition``, this path never pools a skin into one
+    identity vector.  It preserves the reference pixels, chooses a view from
+    the source resident's yaw, and supplies local sprite coordinates so the
+    DiT can distinguish corresponding texture locations.
+    """
+
+    output_channels = 11  # RGB, occupancy, inverse depth, local uv, four view weights
+
+    def __init__(
+        self,
+        height: int = 36,
+        width: int = 64,
+        player_height: float = 1.8,
+        player_aspect: float = 0.45,
+        view_sharpness: float = 8.0,
+        depth_sharpness: float = 8.0,
+    ) -> None:
+        super().__init__()
+        self.height = int(height)
+        self.width = int(width)
+        self.player_height = float(player_height)
+        self.player_aspect = float(player_aspect)
+        self.view_sharpness = float(view_sharpness)
+        self.depth_sharpness = float(depth_sharpness)
+
+    @staticmethod
+    def _select_agent(value: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        batch = torch.arange(len(target), device=value.device)
+        return value[batch, :, target]
+
+    @staticmethod
+    def _project(points, camera_position, forward, right, down, tan_half_fov_x, height, width):
+        relative = points - camera_position
+        depth = (relative * forward).sum(dim=-1)
+        safe_depth = depth.clamp_min(1e-4)
+        tan_half_fov_y = tan_half_fov_x * (height / width)
+        u = ((relative * right).sum(dim=-1) / safe_depth / tan_half_fov_x + 1) * (width - 1) / 2
+        v = ((relative * down).sum(dim=-1) / safe_depth / tan_half_fov_y + 1) * (height - 1) / 2
+        return u, v, depth
+
+    def forward(self, cond: dict, target: torch.Tensor) -> torch.Tensor:
+        skins = cond["player_skin"]
+        position = cond["player_position"]
+        yaw = cond["yaw_pitch"][..., 0]
+        valid = cond["player_valid"].bool()
+        bsz, timesteps, agents, _ = position.shape
+        if skins.ndim != 6 or skins.shape[:3] != (bsz, agents, 4):
+            raise ValueError("player_skin must be [B,A,4,C,H,W]")
+        if skins.shape[3] not in (3, 4):
+            raise ValueError("player_skin references must be RGB or RGBA")
+        view_valid = cond.get("player_appearance_valid")
+        if view_valid is None:
+            view_valid = torch.ones((bsz, agents, 4), device=position.device, dtype=torch.bool)
+        else:
+            view_valid = view_valid.to(device=position.device, dtype=torch.bool)
+        if view_valid.shape != (bsz, agents, 4):
+            raise ValueError("player_appearance_valid must be [B,A,4]")
+
+        dtype = position.dtype
+        skins = skins.to(device=position.device, dtype=dtype)
+        if skins.shape[3] == 3:
+            alpha = torch.ones((*skins.shape[:3], 1, *skins.shape[-2:]), device=skins.device, dtype=dtype)
+            skins = torch.cat((skins, alpha), dim=3)
+
+        camera_position = self._select_agent(cond["camera_position"], target)
+        camera_direction = self._select_agent(cond["camera_direction"], target)
+        fov_x = self._select_agent(cond["camera"], target)[..., -1]
+        target_valid = self._select_agent(valid, target)
+        camera_forward = F.normalize(camera_direction, dim=-1, eps=1e-6)
+        world_down = torch.tensor((0.0, 0.0, -1.0), device=position.device, dtype=dtype)
+        camera_right = F.normalize(
+            torch.cross(world_down.expand_as(camera_forward), camera_forward, dim=-1),
+            dim=-1,
+            eps=1e-6,
+        )
+        camera_down = F.normalize(
+            torch.cross(camera_forward, camera_right, dim=-1), dim=-1, eps=1e-6
+        )
+
+        feet = position
+        head = position.clone()
+        head[..., 2] += self.player_height
+        tan_half_fov_x = torch.tan(fov_x.clamp(0.05, 3.0) / 2)[..., None]
+        foot_u, foot_v, foot_depth = self._project(
+            feet,
+            camera_position[:, :, None],
+            camera_forward[:, :, None],
+            camera_right[:, :, None],
+            camera_down[:, :, None],
+            tan_half_fov_x,
+            self.height,
+            self.width,
+        )
+        head_u, head_v, head_depth = self._project(
+            head,
+            camera_position[:, :, None],
+            camera_forward[:, :, None],
+            camera_right[:, :, None],
+            camera_down[:, :, None],
+            tan_half_fov_x,
+            self.height,
+            self.width,
+        )
+        center_u, center_v = (foot_u + head_u) / 2, (foot_v + head_v) / 2
+        box_h = (foot_v - head_v).abs().clamp(1.0, float(self.height))
+        box_w = (box_h * self.player_aspect).clamp(1.0, float(self.width))
+        depth = (foot_depth + head_depth) / 2
+
+        # Minetest yaw=0 faces +Y.  The view names are ordered as
+        # front/back/left/right in the dataset.
+        source_forward = torch.stack((yaw.sin(), yaw.cos()), dim=-1)
+        source_right = torch.stack((source_forward[..., 1], -source_forward[..., 0]), dim=-1)
+        to_camera = F.normalize(camera_position[:, :, None, :2] - position[..., :2], dim=-1, eps=1e-6)
+        front_score = (to_camera * source_forward).sum(dim=-1)
+        right_score = (to_camera * source_right).sum(dim=-1)
+        view_scores = torch.stack(
+            (front_score, -front_score, -right_score, right_score), dim=-1
+        ) * self.view_sharpness
+        allowed_views = view_valid[:, None].expand(-1, timesteps, -1, -1)
+        view_scores = view_scores.masked_fill(~allowed_views, -1e4)
+        view_weights = view_scores.softmax(dim=-1)
+        selected_skin = torch.einsum("btav,bavchw->btachw", view_weights, skins)
+
+        grid_y = torch.arange(self.height, device=position.device, dtype=dtype)
+        grid_x = torch.arange(self.width, device=position.device, dtype=dtype)
+        local_y = (
+            grid_y.view(1, 1, 1, self.height, 1) - center_v[..., None, None]
+        ) / (box_h[..., None, None] / 2)
+        local_x = (
+            grid_x.view(1, 1, 1, 1, self.width) - center_u[..., None, None]
+        ) / (box_w[..., None, None] / 2)
+        grid = torch.stack(
+            (local_x.expand(-1, -1, -1, self.height, -1),
+             local_y.expand(-1, -1, -1, -1, self.width)),
+            dim=-1,
+        )
+        sampled = F.grid_sample(
+            selected_skin.flatten(0, 2),
+            grid.flatten(0, 2),
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        ).unflatten(0, (bsz, timesteps, agents))
+
+        source_visible = valid & target_valid[..., None] & (depth > 0.05)
+        source_slots = torch.arange(agents, device=position.device)[None, None]
+        source_visible &= source_slots != target[:, None, None]
+        alpha = sampled[..., 3:4, :, :] * source_visible[..., None, None, None].to(dtype)
+        occupancy = alpha.amax(dim=2)
+        logits = -self.depth_sharpness * depth[..., None, None] + alpha[:, :, :, 0].clamp_min(1e-6).log()
+        logits = logits.masked_fill(alpha[:, :, :, 0] <= 1e-5, -1e4)
+        composite_weights = logits.softmax(dim=2) * occupancy
+        unpremultiplied_rgb = sampled[..., :3, :, :] / sampled[..., 3:4, :, :].clamp_min(1e-6)
+        rgb = (unpremultiplied_rgb * composite_weights[..., None, :, :]).sum(dim=2)
+        inverse_depth = (
+            composite_weights * (1 / (1 + depth.clamp_min(0)))[..., None, None]
+        ).sum(dim=2, keepdim=True)
+        uv = grid.permute(0, 1, 2, 5, 3, 4)
+        uv = (uv * composite_weights[..., None, :, :]).sum(dim=2)
+        selected_view = (
+            view_weights[..., :, None, None] * composite_weights[..., None, :, :]
+        ).sum(dim=2)
+        return torch.cat((rgb, occupancy, inverse_depth, uv, selected_view), dim=2).contiguous()
+
+
+class PlayerReferenceLayout(nn.Module):
+    """Return per-resident coarse ROIs and camera-relative view weights.
+
+    The ROI is deliberately only a routing prior. It is wider than the legacy
+    billboard so reference attention can learn limbs and correct projection
+    errors instead of receiving a falsely precise target silhouette.
+    """
+
+    def __init__(self, height=36, width=64, player_height=1.8, player_aspect=.55,
+                 edge_sharpness=1.5, view_sharpness=8.0):
+        super().__init__()
+        self.height, self.width = int(height), int(width)
+        self.player_height, self.player_aspect = float(player_height), float(player_aspect)
+        self.edge_sharpness, self.view_sharpness = float(edge_sharpness), float(view_sharpness)
+
+    def forward(self, cond: dict, target: torch.Tensor):
+        position, yaw = cond["player_position"], cond["yaw_pitch"][..., 0]
+        valid = cond["player_valid"].bool()
+        bsz, timesteps, agents, _ = position.shape
+        camera_position = ViewAwarePlayerAppearance._select_agent(cond["camera_position"], target)
+        camera_direction = ViewAwarePlayerAppearance._select_agent(cond["camera_direction"], target)
+        fov_x = ViewAwarePlayerAppearance._select_agent(cond["camera"], target)[..., -1]
+        target_valid = ViewAwarePlayerAppearance._select_agent(valid, target)
+        dtype = position.dtype
+        forward = F.normalize(camera_direction, dim=-1, eps=1e-6)
+        world_down = torch.tensor((0., 0., -1.), device=position.device, dtype=dtype)
+        right = F.normalize(torch.cross(world_down.expand_as(forward), forward, dim=-1), dim=-1, eps=1e-6)
+        down = F.normalize(torch.cross(forward, right, dim=-1), dim=-1, eps=1e-6)
+        feet, head = position, position.clone()
+        head[..., 2] += self.player_height
+        tan_x = torch.tan(fov_x.clamp(.05, 3.) / 2)[..., None]
+        foot_u, foot_v, foot_depth = ViewAwarePlayerAppearance._project(
+            feet, camera_position[:, :, None], forward[:, :, None], right[:, :, None],
+            down[:, :, None], tan_x, self.height, self.width)
+        head_u, head_v, head_depth = ViewAwarePlayerAppearance._project(
+            head, camera_position[:, :, None], forward[:, :, None], right[:, :, None],
+            down[:, :, None], tan_x, self.height, self.width)
+        center_u, center_v = (foot_u + head_u) / 2, (foot_v + head_v) / 2
+        box_h = (foot_v - head_v).abs().clamp(1., float(self.height))
+        box_w = (box_h * self.player_aspect).clamp(1., float(self.width))
+        grid_y = torch.arange(self.height, device=position.device, dtype=dtype)
+        grid_x = torch.arange(self.width, device=position.device, dtype=dtype)
+        dy = (grid_y.view(1,1,1,self.height,1) - center_v[...,None,None]).abs()
+        dx = (grid_x.view(1,1,1,1,self.width) - center_u[...,None,None]).abs()
+        roi = torch.sigmoid((box_h[...,None,None]/2-dy)*self.edge_sharpness)
+        roi = roi * torch.sigmoid((box_w[...,None,None]/2-dx)*self.edge_sharpness)
+        local_y = (
+            grid_y.view(1, 1, 1, self.height, 1) - center_v[..., None, None]
+        ) / (box_h[..., None, None] / 2)
+        local_x = (
+            grid_x.view(1, 1, 1, 1, self.width) - center_u[..., None, None]
+        ) / (box_w[..., None, None] / 2)
+        local_coordinates = torch.stack(
+            (
+                local_x.expand(-1, -1, -1, self.height, -1),
+                local_y.expand(-1, -1, -1, -1, self.width),
+            ),
+            dim=-1,
+        ).clamp(-2, 2)
+        visible = valid & target_valid[...,None] & (((foot_depth + head_depth) / 2) > .05)
+        slots = torch.arange(agents, device=position.device)[None,None]
+        visible &= slots != target[:,None,None]
+        roi *= visible[...,None,None].to(dtype)
+
+        source_forward = torch.stack((yaw.sin(), yaw.cos()), dim=-1)
+        source_right = torch.stack((source_forward[...,1], -source_forward[...,0]), dim=-1)
+        to_camera = F.normalize(camera_position[:,:,None,:2]-position[...,:2], dim=-1, eps=1e-6)
+        front = (to_camera * source_forward).sum(-1)
+        right_score = (to_camera * source_right).sum(-1)
+        view_weights = torch.stack((front, -front, -right_score, right_score), -1)
+        view_weights = (view_weights * self.view_sharpness).softmax(-1)
+        view_weights *= visible[...,None].to(dtype)
+        return (
+            roi.contiguous(),
+            view_weights.contiguous(),
+            local_coordinates.contiguous(),
+        )
+
+
+class PlayerReferenceEncoder(nn.Module):
+    """Encode native RGBA views into spatial tokens without square resizing."""
+
+    def __init__(self, output_dim=256, grid_size=(8, 4), position_encoding=False):
+        super().__init__()
+        self.output_dim, self.grid_size = int(output_dim), tuple(grid_size)
+        if position_encoding and self.output_dim % 4:
+            raise ValueError("2D reference position encoding requires output_dim divisible by 4")
+        self.encoder = nn.Sequential(
+            nn.Conv2d(4, 32, 3, 2, 1), nn.SiLU(),
+            nn.Conv2d(32, 64, 3, 2, 1), nn.SiLU(),
+            nn.Conv2d(64, 128, 3, 2, 1), nn.SiLU(),
+            nn.Conv2d(128, output_dim, 3, 2, 1), nn.SiLU(),
+            nn.AdaptiveAvgPool2d(self.grid_size),
+        )
+        self.view_embedding = nn.Parameter(torch.randn(4, output_dim) * .02)
+        position = self._make_2d_position_embedding(*self.grid_size, self.output_dim)
+        self.register_buffer(
+            "position_embedding",
+            position if position_encoding else None,
+            persistent=False,
+        )
+
+    @staticmethod
+    def _make_2d_position_embedding(height, width, dim):
+        y, x = torch.meshgrid(
+            torch.arange(height, dtype=torch.float32),
+            torch.arange(width, dtype=torch.float32),
+            indexing="ij",
+        )
+        frequencies = torch.arange(dim // 4, dtype=torch.float32)
+        frequencies = 1 / (10000 ** (frequencies / max(dim // 4, 1)))
+        x = x.flatten()[:, None] * frequencies[None]
+        y = y.flatten()[:, None] * frequencies[None]
+        return torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim=-1)
+
+    def forward(self, reference, valid=None):
+        if reference.ndim != 6 or reference.shape[2:4] != (4, 4):
+            raise ValueError("player_reference must be [B,A,4,4,H,W]")
+        bsz, agents, views = reference.shape[:3]
+        encoded = self.encoder(reference.flatten(0, 2))
+        encoded = encoded.flatten(2).transpose(1, 2).unflatten(0, (bsz, agents, views))
+        encoded = encoded + self.view_embedding[None,None,:,None].to(encoded.dtype)
+        if self.position_embedding is not None:
+            encoded = encoded + self.position_embedding[None, None, None].to(encoded.dtype)
+        if valid is not None:
+            encoded *= valid.to(encoded.dtype)[...,None,None]
+        return encoded
+
+
+class ROIAppearanceProjector(nn.Module):
+    """Query four separate reference views into a target-space feature map.
+
+    Geometry supplies queries and a soft ROI only. Reference views are neither
+    selected nor blended: each view is attended independently and occupies its
+    own output channel group before the joint video/voxel patch embedding.
+    """
+
+    def __init__(
+        self,
+        reference_dim: int,
+        actor_dim: int,
+        output_channels: int,
+        height: int,
+        width: int,
+        attention_dim: int = 64,
+    ) -> None:
+        super().__init__()
+        if output_channels % 4:
+            raise ValueError("ROI appearance channels must be divisible by four")
+        self.output_channels = int(output_channels)
+        self.height, self.width = int(height), int(width)
+        self.channels_per_view = self.output_channels // 4
+        self.reference_norm = nn.LayerNorm(reference_dim)
+        self.query = nn.Sequential(
+            nn.Linear(actor_dim + 4, attention_dim),
+            nn.SiLU(),
+            nn.Linear(attention_dim, attention_dim),
+        )
+        self.key = nn.Linear(reference_dim, attention_dim, bias=False)
+        self.value = nn.Linear(reference_dim, self.channels_per_view)
+        self.scale = attention_dim ** -0.5
+
+        screen_y, screen_x = torch.meshgrid(
+            torch.linspace(-1, 1, self.height),
+            torch.linspace(-1, 1, self.width),
+            indexing="ij",
+        )
+        self.register_buffer(
+            "screen_coordinates",
+            torch.stack((screen_x, screen_y), dim=-1),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        reference: torch.Tensor,
+        roi: torch.Tensor,
+        local_coordinates: torch.Tensor,
+        actor_features: torch.Tensor,
+        valid: torch.Tensor,
+    ) -> torch.Tensor:
+        # reference [B,A,4,N,R], roi [B,T,A,H,W], actor [B,T,A,C]
+        if reference.ndim != 5 or reference.shape[2] != 4:
+            raise ValueError("reference must be [B,A,4,N,D]")
+        bsz, agents, views = reference.shape[:3]
+        if roi.ndim != 5 or roi.shape[0] != bsz or roi.shape[2:] != (
+            agents, self.height, self.width
+        ):
+            raise ValueError("ROI must be [B,T,A,H,W]")
+        frames = roi.shape[1]
+        expected_coordinates = (bsz, frames, agents, self.height, self.width, 2)
+        if local_coordinates.shape != expected_coordinates:
+            raise ValueError(
+                f"local coordinates must have shape {expected_coordinates}"
+            )
+        if actor_features.shape[:3] != (bsz, frames, agents):
+            raise ValueError("actor features must be [B,T,A,C]")
+        if valid.shape != (bsz, agents, views):
+            raise ValueError("reference valid mask must be [B,A,4]")
+
+        screen = self.screen_coordinates.to(
+            device=roi.device, dtype=roi.dtype
+        )[None, None, None].expand(bsz, frames, agents, -1, -1, -1)
+        actor = actor_features.to(roi.dtype)[..., None, None, :].expand(
+            -1, -1, -1, self.height, self.width, -1
+        )
+        query = self.query(
+            torch.cat((screen, local_coordinates.to(roi.dtype), actor), dim=-1)
+        )
+
+        normalized = self.reference_norm(reference.to(query.dtype))
+        key, value = self.key(normalized), self.value(normalized)
+        score = torch.einsum("btahwd,bavnd->btahwvn", query, key) * self.scale
+        reference_valid = valid.bool()[:, None, :, None, None, :, None]
+        score = score.masked_fill(~reference_valid, -1e4)
+        attention = score.softmax(dim=-1)
+        projected = torch.einsum(
+            "btahwvn,bavnc->btahwvc", attention, value
+        )
+        projected *= valid.to(projected.dtype)[:, None, :, None, None, :, None]
+
+        # Preserve view identity by concatenating the four independently
+        # queried feature groups. Residents are combined only in target space.
+        projected = projected.flatten(-2)
+        projected *= roi.to(projected.dtype)[..., None]
+        projected = projected.sum(dim=2)
+        return projected.permute(0, 1, 4, 2, 3).contiguous()

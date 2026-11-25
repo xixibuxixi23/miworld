@@ -1,0 +1,43 @@
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# macOS metadata accidentally copied through shared storage
+.DS_Store
+._*
+
+# Local environments and experiment tracking
+.venv/
+venv/
+environment*/
+wandb/
+
+# Large data, weights, and generated experiment state belong in artifact storage
+/artifacts/
+/checkpoints/
+/data/
+/evals/
+/inputs/
+/logs/
+/outputs/
+/parameters/
+/runs/
+/tmp/
+/transfers/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.tar
+*.tar.gz
+*.tgz
+*.mp4
+
+# Local-only launch overrides
+.env
+.env.*
+local_config.*
+

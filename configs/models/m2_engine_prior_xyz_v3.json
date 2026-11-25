@@ -1,0 +1,22 @@
+{
+  "schema": "m2-local-world-writer-v2-engine-prior-xyz",
+  "model": {
+    "num_block_classes": 402,
+    "num_items": 13,
+    "air_class": 28,
+    "width": 256,
+    "depth": 6,
+    "heads": 8,
+    "timesteps": 8,
+    "distance_per_step": 0.08555694974465658,
+    "position_prior": "action",
+    "velocity_mode": "conditioned_integrated",
+    "velocity_residual_limit": 0.03,
+    "velocity_residual_penalty": true,
+    "engine_jump_speed": 6.6,
+    "engine_gravity": 20.8,
+    "engine_substeps": 5,
+    "engine_fps": 24.0
+  },
+  "note": "Horizontal engine prior plus a fixed 16-frame VoxeLibre jump table; the unchanged XYZ head predicts only a 0.03-block-per-frame residual."
+}

@@ -1,0 +1,15 @@
+{
+  "schema": "miworld-model-registry-v1",
+  "models": {
+    "m1": {
+      "checkpoint": "artifact://miworld/m1/default"
+    },
+    "m2": {
+      "checkpoint": "artifact://miworld/m2/building_overfit_long8/step-003100"
+    },
+    "m3": {
+      "renderer_checkpoint": "artifact://miworld/m3/renderer/step-082416",
+      "policy_checkpoint": "artifact://miworld/m3/future_latent_action_v2/step-018500"
+    }
+  }
+}
